@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Float8 (FP8) training — reduced precision for faster matmul.
 
 FP8 uses 8-bit floating point for forward and backward passes.
@@ -29,77 +31,107 @@ Reference: Micikevicius et al. 2022 (FP8 Formats for DDL)
            PyTorch torchao.float8
 """
 
+from dataclasses import dataclass, field
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
+# Try to import torchao FP8
+_TORCHAO_AVAILABLE = False
+try:
+    from torchao.float8 import (
+        Float8LinearConfig,
+        convert_to_float8_training,
+        precompute_float8_dynamic_scale_for_fsdp,
+    )
 
+    _TORCHAO_AVAILABLE = True
+except ImportError:
+    pass
+
+
+@dataclass
 class FP8Config:
-    """Configuration for FP8 training.
+    """Configuration for FP8 training via torchao.
+
+    All fields map directly to torchao's Float8LinearConfig when available.
 
     Attributes:
         enabled: whether to use FP8
-        forward_dtype: FP8 format for forward (E4M3 or E5M2)
-        backward_dtype: FP8 format for backward (E5M2 typically)
-        recipe: training recipe (" DelayedScaling" or "MaxOptimal")
+        forward_dtype: FP8 format for forward activations ("float8_e4m3fn" or "float8_e5m2")
+        backward_dtype: FP8 format for backward gradients ("float8_e5m2" typically)
+        recipe_name: scaling recipe ("max" for MaxOptimal, "delayed" for DelayedScaling)
         force_recompute_fp8_weight_in_bwd: recompute weight in backward to save memory
+        cast_input_text: whether to cast input to FP8 before matmul
+        filter_fn: optional module filter — only convert matching modules to FP8
     """
 
-    def __init__(
-        self,
-        enabled: bool = False,
-        forward_dtype: str = "e4m3",
-        backward_dtype: str = "e5m2",
-        recipe: str = "DelayedScaling",
-        force_recompute_fp8_weight_in_bwd: bool = True,
-    ):
-        self.enabled = enabled
-        self.forward_dtype = forward_dtype
-        self.backward_dtype = backward_dtype
-        self.recipe = recipe
-        self.force_recompute_fp8_weight_in_bwd = force_recompute_fp8_weight_in_bwd
+    enabled: bool = False
+    forward_dtype: str = "float8_e4m3fn"
+    backward_dtype: str = "float8_e5m2"
+    recipe_name: str = "max"
+    force_recompute_fp8_weight_in_bwd: bool = True
+    cast_input_text: bool = True
+    filter_fn: Optional[str] = None
+
+    def build_torchao_config(self) -> Optional[object]:
+        """Build torchao Float8LinearConfig from this config."""
+        if not _TORCHAO_AVAILABLE:
+            return None
+        if not self.enabled:
+            return None
+
+        return Float8LinearConfig(
+            forward_dtype=self.forward_dtype,
+            backward_dtype=self.backward_dtype,
+            recipe_name=self.recipe_name,
+            force_recompute_fp8_weight_in_bwd=self.force_recompute_fp8_weight_in_bwd,
+        )
 
 
 def apply_fp8(
     model: nn.Module,
-    config: FP8Config | None = None,
+    config: Optional[FP8Config] = None,
 ) -> nn.Module:
     """Apply FP8 training to a model.
 
-    This converts linear layers to use FP8 computation. The model
-    must be on CUDA for FP8 to work.
+    When torchao is available, uses convert_to_float8_training() which:
+        - Converts Linear layers to FP8 computation
+        - Handles dynamic scaling of activations
+        - Supports weight recompute in backward
+        - Integrates with FSDP2 (Float8ColwiseParallel, Float8RowwiseParallel)
 
-    Usage:
-        config = FP8Config(enabled=True)
-        model = apply_fp8(model, config)
+    When torchao is unavailable (e.g. macOS), this is a no-op.
 
-    Production note:
-        In real training, use torchao's Float8LinearConfig:
-            from torchao.float8 import convert_to_float8_training, Float8LinearConfig
-            config = Float8LinearConfig(
-                cast_input_text=True,
-                force_recompute_fp8_weight_in_bwd=True,
-            )
-            convert_to_float8_training(model, config=config)
-
-        This handles:
-            - Automatic casting of inputs to FP8 before matmul
-            - Dynamic scaling of activations
-            - Weight recompute in backward
-            - Integration with FSDP2 (Float8ColwiseParallel, Float8RowwiseParallel)
+    :param model: model to convert
+    :param config: FP8 configuration (default: disabled)
+    :returns: model with FP8 applied (or unchanged if torchao unavailable)
     """
     if config is None or not config.enabled:
         return model
 
-    # In production, use torchao:
-    # from torchao.float8 import convert_to_float8_training, Float8LinearConfig
-    # convert_to_float8_training(model, config=Float8LinearConfig(...))
+    if not _TORCHAO_AVAILABLE:
+        print(
+            "[FP8] torchao not available — skipping FP8 conversion. "
+            "Install with: pip install torchao"
+        )
+        return model
 
-    # For learning, we show the manual approach:
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            # Convert to FP8 linear (simplified — production uses torchao)
-            module.weight.data = module.weight.data.to(torch.float8_e4m3fn)
-            if module.bias is not None:
-                module.bias.data = module.bias.data.to(torch.bfloat16)
-
+    torchao_config = config.build_torchao_config()
+    model = convert_to_float8_training(model, config=torchao_config)
     return model
+
+
+def precompute_fp8_dynamic_scales(model: nn.Module) -> None:
+    """Precompute FP8 dynamic scales for FSDP integration.
+
+    Must be called after FSDP sharding but before the forward pass.
+    This computes per-parameter scales based on weight magnitudes.
+
+    :param model: model with FP8 applied
+    """
+    if not _TORCHAO_AVAILABLE:
+        return
+
+    precompute_float8_dynamic_scale_for_fsdp(model)

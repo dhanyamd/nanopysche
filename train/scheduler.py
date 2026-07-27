@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Learning rate schedulers — production implementations.
 
 Common schedules for LLM training:

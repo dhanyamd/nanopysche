@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """DiLoCo-style gradient compression for communication-efficient training.
 
 DiLoCo (Distributed Low-Communication) reduces the bytes sent over the wire

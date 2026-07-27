@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Config system — dataclass-based with build() pattern.
 
 Matches OLMo-core Config/ModuleConfig pattern:

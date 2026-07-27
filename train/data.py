@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Distributed data loading — rank-aware batching and sharding.
 
 In production distributed training, each rank must see DIFFERENT data

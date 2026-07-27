@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Hang detection — detect and kill stuck ranks in distributed training.
 
 In multi-node training, ranks can hang due to:

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Pipeline Parallelism — GPipe, 1F1B, and communication primitives.
 
 Pipeline parallelism splits the model vertically across GPUs:

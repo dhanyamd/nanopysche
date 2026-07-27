@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Distributed checkpointing — save/load model state across ranks.
 
 Production distributed training requires checkpointing that works with

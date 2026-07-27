@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Transformer — full model assembly with composable parallelism.
 
 Matches OLMo-core nn.transformer pattern:
@@ -328,6 +330,17 @@ class Transformer(nn.Module):
         :param pp_mesh: pipeline parallel DeviceMesh.
         """
         self._pp_enabled = True
+
+    def apply_ep(self, ep_config):
+        """Apply Expert Parallelism to MoE layers in all blocks.
+
+        :param ep_config: ExpertParallelConfig with ep_size and ep_group.
+        """
+        from nanopsyche.model.moe import MoEBase, ExpertParallelConfig
+
+        for block in self.blocks.values():
+            if isinstance(block.feed_forward, MoEBase):
+                block.feed_forward.ep = ep_config
 
     def apply_fsdp(
         self,

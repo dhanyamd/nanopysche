@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Fault-tolerant checkpointing — resume after node failures.
 
 Production distributed training MUST handle node failures. On a 1000-GPU

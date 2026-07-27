@@ -39,6 +39,7 @@ from nanopsyche.distributed.fsdp import (
     DataParallelConfig,
     apply_activation_checkpointing,
 )
+from nanopsyche.fp8.training import FP8Config, apply_fp8
 
 log = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ def parallelize_model(
     cp_config: Optional[ContextParallelConfig] = None,
     pp_config: Optional[PipelineParallelConfig] = None,
     dp_config: Optional[DataParallelConfig] = None,
-    float8_enabled: bool = False,
+    fp8_config: Optional[FP8Config] = None,
     compile_model: bool = False,
     ac_mode: Optional[str] = None,
     ac_block_interval: Optional[int] = None,
@@ -71,7 +72,7 @@ def parallelize_model(
     :param cp_config: context parallelism config.
     :param pp_config: pipeline parallelism config.
     :param dp_config: data parallelism config.
-    :param float8_enabled: enable FP8 training.
+    :param fp8_config: FP8 training configuration (None to disable).
     :param compile_model: enable torch.compile per block.
     :param ac_mode: activation checkpointing mode ("full", "selected_blocks").
     :param ac_block_interval: for "selected_blocks", checkpoint every N-th.
@@ -86,10 +87,9 @@ def parallelize_model(
             model.apply_pp(get_pp_mesh(world_mesh))
 
     # 2. FP8 (swap linear layers to Float8)
-    if float8_enabled:
+    if fp8_config is not None and fp8_config.enabled:
         log.info("  Applying FP8")
-        if hasattr(model, "apply_fp8"):
-            model.apply_fp8()
+        model = apply_fp8(model, config=fp8_config)
 
     # 3. Context Parallelism (shard sequence across CP ranks)
     if cp_config is not None:
