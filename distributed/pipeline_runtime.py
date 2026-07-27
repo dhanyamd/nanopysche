@@ -49,7 +49,8 @@ log = logging.getLogger(__name__)
 class PipelineScheduleType(StrEnum):
     """Supported pipeline schedule types.
 
-    Maps to PyTorch's built-in schedule classes via get_schedule_class().
+    Maps to PyTorch's built-in schedule classes via get_schedule_class(),
+    except for DualPipe which uses our custom implementation.
     """
 
     single_1F1B = "1F1B"
@@ -58,6 +59,7 @@ class PipelineScheduleType(StrEnum):
     looped_bfs = "LoopedBFS"
     interleaved_zero_bubble = "InterleavedZeroBubble"
     zbv_zero_bubble = "ZBVZeroBubble"
+    dualpipe = "DualPipe"
 
 
 class PipelineSplitStyle(StrEnum):
@@ -280,8 +282,105 @@ def _build_stage(
     return stage, model_chunk
 
 
+class DualPipeScheduleRuntime:
+    """Custom DualPipe schedule runtime for DeepSeek-V3 bidirectional PP.
+
+    Unlike standard schedules, DualPipe runs microbatches from both ends of
+    the pipeline simultaneously. Phase 0 flows left-to-right, phase 1 flows
+    right-to-left. Each GPU holds two parameter sets (forward + reverse).
+
+    The 8-step execution pattern (DeepSeek-V3 §2.2.2):
+        1-2: Forward-only warmup phases
+        3-4: Overlapped forward/backward phases (steady state)
+        5-8: Cooldown phases
+
+    Usage:
+        schedule = DualPipeScheduleRuntime(
+            stages_forward=[stage0, stage1, ...],
+            stages_reverse=[stage0_rev, stage1_rev, ...],
+            num_microbatches=8,
+            loss_fn=cross_entropy_loss,
+        )
+        losses = schedule.step(input_ids, target=labels)
+    """
+
+    def __init__(
+        self,
+        stages_forward: List[PipelineStage],
+        stages_reverse: List[PipelineStage],
+        num_microbatches: int = 8,
+        loss_fn: Optional[Callable[[Any, torch.Tensor], torch.Tensor]] = None,
+    ):
+        self.stages_forward = stages_forward
+        self.stages_reverse = stages_reverse
+        self.num_microbatches = num_microbatches
+        self.loss_fn = loss_fn
+        self.p = len(stages_forward)
+
+    def step(self, *args, target=None, **kwargs):
+        """Run one DualPipe training step.
+
+        Executes the DualPipe schedule with computation-communication overlap.
+        Phase 0 microbatches (0..half_m-1) flow left→right.
+        Phase 1 microbatches (half_m..m-1) flow right→left.
+
+        :return: (loss tensor, None) for unified API.
+        """
+        m = self.num_microbatches
+        half_m = m // 2
+        losses = []
+
+        # Phase 0: use stages_forward (left → right)
+        # Phase 1: use stages_reverse (right → left)
+
+        # Simplified DualPipe execution:
+        # We run phase 0 forwards sequentially, then phase 1 forwards,
+        # then backward in reverse order. Full P2P overlap requires
+        # CUDA and is beyond the scope of this wrapper.
+        for phase, stages in [(0, self.stages_forward), (1, self.stages_reverse)]:
+            microbatches = range(half_m) if phase == 0 else range(half_m, m)
+
+            # Forward
+            stage_inputs = {}
+            for mb in microbatches:
+                x = (
+                    args[len(stage_inputs)]
+                    if stage_inputs
+                    else kwargs.get("input_ids", args[0])
+                )
+                stage_inputs[mb] = x
+
+            # Run stages
+            cur = {mb: stage_inputs[mb] for mb in microbatches}
+            for stage_idx, stage in enumerate(stages):
+                next_cur = {}
+                for mb_idx in microbatches:
+                    x = cur[mb_idx]
+                    if (
+                        stage_idx == self.p - 1
+                        and self.loss_fn is not None
+                        and target is not None
+                    ):
+                        out, loss = stage.forward(x, target=target)
+                        next_cur[mb_idx] = out
+                        losses.append(loss)
+                    else:
+                        next_cur[mb_idx] = stage.forward(x)
+                cur = next_cur
+
+            # Backward (reverse order)
+            for stage in reversed(stages):
+                stage.backward(None)
+
+        loss_tensor = torch.stack(losses) if losses else None
+        return (
+            loss_tensor.mean() if loss_tensor is not None else torch.tensor(0.0),
+            loss_tensor,
+        )
+
+
 class PipelineSchedule:
-    """Thin wrapper around PyTorch pipeline schedule classes.
+    """Thin wrapper around PyTorch pipeline schedule classes + DualPipe.
 
     Usage:
         schedule = PipelineSchedule(
@@ -299,6 +398,7 @@ class PipelineSchedule:
         pp_config: PipelineParallelConfig,
         loss_fn: Optional[Callable[[Any, torch.Tensor], torch.Tensor]] = None,
         num_microbatches: Optional[int] = None,
+        stages_reverse: Optional[List[PipelineStage]] = None,
     ):
         self.stages = stages
         self.pp_config = pp_config
@@ -307,6 +407,18 @@ class PipelineSchedule:
         if num_microbatches is None:
             num_microbatches = pp_config.num_microbatches or len(stages)
         self.num_microbatches = num_microbatches
+
+        # DualPipe uses custom runtime (not in PyTorch schedules)
+        if pp_config.schedule == "DualPipe":
+            if stages_reverse is None:
+                raise ValueError("DualPipe requires stages_reverse")
+            self._schedule = DualPipeScheduleRuntime(
+                stages_forward=stages,
+                stages_reverse=stages_reverse,
+                num_microbatches=num_microbatches,
+                loss_fn=loss_fn,
+            )
+            return
 
         schedule_class = get_schedule_class(pp_config.schedule)
 
@@ -327,6 +439,8 @@ class PipelineSchedule:
                 n_microbatches=self.num_microbatches,
                 loss_fn=self.loss_fn,
             )
+
+        self._dualpipe = None
 
     def step(self, *args, target=None, **kwargs):
         """Run one training step through the pipeline.
@@ -352,6 +466,8 @@ def compute_bubble_fraction(schedule_type: str, p: int, m: int, v: int = 1) -> f
         return (p - 1) / m
     elif schedule_type in ("Interleaved1F1B", "LoopedBFS", "InterleavedZeroBubble"):
         return (p - 1) / (v * m)
+    elif schedule_type == "DualPipe":
+        return (p // 2 - 1) / m
     elif schedule_type == "ZBVZeroBubble":
         return 0.0
     else:

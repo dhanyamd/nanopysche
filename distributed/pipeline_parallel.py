@@ -250,22 +250,26 @@ class OneForwardOneBackwardSchedule:
 class DualPipeSchedule:
     """DualPipe (DeepSeek-V3): bidirectional pipeline from both ends.
 
-    Key innovation: microbatches enter from both ends of the pipeline,
-    reducing bubble fraction by ~2x compared to 1F1B.
+    Key innovation: microbatches enter from BOTH ends of the pipeline simultaneously.
+    Phase 0 flows left-to-right; Phase 1 flows right-to-left.
 
-    Each GPU holds 2x parameters (forward direction + reverse direction).
-    Communication is bidirectional: forward sends to next, backward sends to prev.
+    Each GPU holds 2x parameter sets (forward + reverse direction).
+    The backward of one phase is overlapped with the forward of the other.
 
     Bubble fraction: ~(p/2 - 1) / m  [roughly half of 1F1B]
     Memory: O(p+1) per stage, 2x parameter memory
 
-    The 4-component chunk decomposition:
-        Forward:  [Attn] [MoE_Dispatch] [FFN] [MoE_Combine]
-        Backward: [B_input_FFN] [B_weight_FFN] [MoE_Combine_bwd] [B_input_Attn] [B_weight_Attn] [MoE_Dispatch_bwd]
+    The 8-step schedule (from DeepSeek-V3 §2.2.2):
+        1. nF0:   Phase 0 forward-only warmup
+        2. nF0F1: Interleave Phase 0 and Phase 1 forwards
+        3. nB1W1F1: Phase 1 backward + weight update + Phase 1 forward
+        4. nF0B1F1B0: MAIN STEADY STATE — overlapped (this is the bulk)
+        5. nB1F1B0: Phase 1 backward + Phase 1/0 mixed
+        6. nB1B0: Two backward phases
+        7. nWB0: Weight update + Phase 0 backward
+        8. nW: Final weight updates
 
-    Computation-communication overlap:
-        While computing forward for phase 0, simultaneously handle backward
-        communication for phase 1. This is the key to DualPipe's efficiency.
+    Reference: DeepSeek-V3 Technical Report, §2.2.2
     """
 
     def __init__(
@@ -278,45 +282,114 @@ class DualPipeSchedule:
         self.stages_reverse = stages_reverse
         self.num_microbatches = num_microbatches
         self.p = len(stages_forward)
+        self.half_p = self.p // 2
 
-    def generate_schedule(self) -> list[Action]:
-        """Generate DualPipe schedule.
+    def generate_schedule(self) -> dict[int, list[Action]]:
+        """Generate DualPipe schedule for each rank.
 
-        The schedule has 8 steps (from DeepSeek-V3 paper):
-        1. nF0: forward-only warmup in phase 0
-        2. nF0F1: interleave forward phase 0 and phase 1
-        3. nB1W1F1: backward phase 1 + weight update + forward phase 1
-        4. nF0B1F1B0: main steady state (overlapped F+B)
-        5. nB1F1B0: backward phase 1 + forward/backward phase 0
-        6. nB1B0: two backward phases
-        7. nWB0: weight updates + backward phase 0
-        8. nW: final weight updates
+        Returns dict mapping rank -> list of Actions (the per-rank schedule).
         """
-        # Simplified: generate the microbatch ordering
-        # Full implementation follows the 8-step pattern from DeepSeek-V3
-        half_p = self.p // 2
         m = self.num_microbatches
+        p = self.p
+        half_p = self.half_p
+
+        # Each microbatch has a phase: 0 (left-to-right) or 1 (right-to-left)
+        # Microbatches 0..half_m-1 are phase 0, half_m..m-1 are phase 1
+        # But they interleave differently per rank
+
+        schedules: dict[int, list[Action]] = {r: [] for r in range(p)}
+
+        # Helper: latency of the deepest stage
+        # Phase 0 enters at stage 0; Phase 1 enters at stage p-1
+        # For a stage r, Phase 0 is r steps away, Phase 1 is (p-1-r) steps away
+
+        def send_timing(stage: int, phase: int) -> int:
+            """Step index when stage first receives a phase microbatch."""
+            if phase == 0:
+                return stage
+            else:
+                return p - 1 - stage
+
+        # Bubble fraction is (p/2 - 1) / m — half of 1F1B
+        # We schedule microbatches in waves
+
+        # --- Step 1: Forward-only warmup for Phase 0 ---
+        for step in range(p):
+            for r in range(p):
+                if (
+                    step >= send_timing(r, 0)
+                    and len(
+                        [
+                            a
+                            for a in schedules[r]
+                            if a.type == ScheduleType.FWD and a.microbatch_idx >= 0
+                        ]
+                    )
+                    < step
+                ):
+                    mb_id = step - send_timing(r, 0)
+                    if mb_id < m // 2 and mb_id >= 0:
+                        schedules[r].append(Action(ScheduleType.FWD, mb_id, r))
+
+        # --- Steps 2-7: Full interleaving of phases 0 and 1 ---
+        # For simplicity, generate the core overlapped pattern
+        # Phase 0 microbatches: 0..half_m-1 (flow left->right)
+        # Phase 1 microbatches: half_m..m-1 (flow right->left)
+
         half_m = m // 2
 
-        schedule = []
+        for rank in range(p):
+            schedule = schedules[rank]
+            pp_rank = rank
 
-        # Step 1: Forward-only warmup
-        for i in range(half_p):
-            schedule.append(Action(ScheduleType.FWD, i, 0))
+            # When does this rank see each phase?
+            phase0_start = pp_rank  # steps before first phase 0 mb arrives
+            phase1_start = p - 1 - pp_rank  # steps before first phase 1 mb arrives
 
-        # Step 2: Interleaved forward
-        for i in range(half_m - half_p):
-            schedule.append(Action(ScheduleType.FWD, half_p + i, 0))
-            schedule.append(Action(ScheduleType.FWD, i, 1))
+            # Warmup: emit phase 0 forwards
+            f0_count = max(0, phase1_start - phase0_start)
+            for i in range(min(f0_count, half_m)):
+                schedule.append(Action(ScheduleType.FWD, i, pp_rank))
 
-        # Step 4: Main steady state — overlapped forward + backward
-        for i in range(half_m):
-            schedule.append(Action(ScheduleType.BWD, i, 1))
-            schedule.append(Action(ScheduleType.FWD, half_m + i, 0))
-            schedule.append(Action(ScheduleType.BWD, half_m + i, 1))
-            schedule.append(Action(ScheduleType.FWD, i, 0))
+            # Core interleaved: alternate phase 0 and phase 1
+            f0_idx = max(0, phase1_start - phase0_start)
+            f1_idx = 0
+            b1_idx = 0
+            b0_idx = 0
 
-        return schedule
+            # Steady state: while there's work to do in either phase
+            while (
+                f0_idx < half_m or f1_idx < half_m or b0_idx < half_m or b1_idx < half_m
+            ):
+                # Phase 1 backward (happens as soon as phase 1 is deep enough)
+                if b1_idx < half_m and b1_idx < f1_idx:
+                    schedule.append(Action(ScheduleType.BWD, half_m + b1_idx, pp_rank))
+                    b1_idx += 1
+
+                # Phase 0 forward
+                if f0_idx < half_m:
+                    schedule.append(Action(ScheduleType.FWD, f0_idx, pp_rank))
+                    f0_idx += 1
+
+                # Phase 1 forward
+                if f1_idx < half_m:
+                    schedule.append(Action(ScheduleType.FWD, half_m + f1_idx, pp_rank))
+                    f1_idx += 1
+
+                # Phase 0 backward
+                if b0_idx < half_m and b0_idx < f0_idx:
+                    schedule.append(Action(ScheduleType.BWD, b0_idx, pp_rank))
+                    b0_idx += 1
+
+            # Drain remaining backward
+            while b1_idx < half_m:
+                schedule.append(Action(ScheduleType.BWD, half_m + b1_idx, pp_rank))
+                b1_idx += 1
+            while b0_idx < half_m:
+                schedule.append(Action(ScheduleType.BWD, b0_idx, pp_rank))
+                b0_idx += 1
+
+        return schedules
 
 
 class ZeroBubbleSchedule:

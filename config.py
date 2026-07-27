@@ -6,7 +6,7 @@ Matches OLMo-core Config/ModuleConfig pattern:
     1. Define configs as dataclasses
     2. Config.build() constructs the actual object
     3. CLI overrides via dot-notation
-    4. Serialization to/from JSON
+    4. Serialization to/from JSON and YAML
 
 Reference: OLMo-core src/olmo_core/config.py
 """
@@ -14,7 +14,14 @@ Reference: OLMo-core src/olmo_core/config.py
 import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Dict
+
+try:
+    import yaml as _yaml
+
+    _HAS_YAML = True
+except ImportError:
+    _HAS_YAML = False
 
 
 @dataclass
@@ -30,24 +37,59 @@ class Config:
     def save(self, path: str | Path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        data = self.as_dict()
         with open(path, "w") as f:
-            json.dump(self.as_dict(), f, indent=2, default=str)
+            if path.suffix in (".yaml", ".yml") and _HAS_YAML:
+                _yaml.dump(data, f, default_flow_style=False)
+            else:
+                json.dump(data, f, indent=2, default=str)
 
     @classmethod
     def load(cls, path: str | Path) -> "Config":
+        path = Path(path)
         with open(path) as f:
-            data = json.load(f)
-        return cls(**data)
+            if path.suffix in (".yaml", ".yml") and _HAS_YAML:
+                data = _yaml.safe_load(f)
+            else:
+                data = json.load(f)
+        if data is None:
+            data = {}
+        return cls._from_dict(data)
 
-    def merge(self, overrides: dict[str, Any]) -> "Config":
+    @classmethod
+    def _from_dict(cls, data: Dict[str, Any]) -> "Config":
         import dataclasses
 
-        fields_dict = {f.name: f for f in dataclasses.fields(self)}
-        new_values = {}
+        field_types = {f.name: f.type for f in dataclasses.fields(cls)}
+        kwargs = {}
+        for key, value in data.items():
+            if key not in field_types:
+                continue
+            expected_type = field_types[key]
+            if isinstance(value, dict) and hasattr(
+                expected_type, "__dataclass_fields__"
+            ):
+                kwargs[key] = expected_type._from_dict(value)
+            else:
+                kwargs[key] = value
+        return cls(**kwargs)
+
+    def merge(self, overrides: Dict[str, Any]) -> "Config":
+        import copy
+
+        obj = copy.deepcopy(self)
         for key, value in overrides.items():
-            if key in fields_dict:
-                new_values[key] = value
-        return dataclasses.replace(self, **new_values)
+            parts = key.split(".")
+            current = obj
+            for part in parts[:-1]:
+                if hasattr(current, part):
+                    current = getattr(current, part)
+                else:
+                    break
+            else:
+                if hasattr(current, parts[-1]):
+                    setattr(current, parts[-1], value)
+        return obj
 
     @classmethod
     def from_cli(cls, args: list[str]) -> "Config":
@@ -56,17 +98,22 @@ class Config:
         while i < len(args):
             if args[i].startswith("--"):
                 key = args[i][2:]
-                value = args[i + 1]
-                try:
-                    value = int(value)
-                except ValueError:
+                if i + 1 < len(args):
+                    value: Any = args[i + 1]
                     try:
-                        value = float(value)
+                        value = int(value)
                     except ValueError:
-                        if value.lower() in ("true", "false"):
-                            value = value.lower() == "true"
-                overrides[key] = value
-                i += 2
+                        try:
+                            value = float(value)
+                        except ValueError:
+                            if value.lower() in ("true", "false"):
+                                value = value.lower() == "true"
+                            elif value.lower() in ("none", "null"):
+                                value = None
+                    overrides[key] = value
+                    i += 2
+                else:
+                    i += 1
             else:
                 i += 1
         return cls().merge(overrides)

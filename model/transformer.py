@@ -116,15 +116,27 @@ class TransformerBlock(nn.Module):
         x = h + self.dropout(self.feed_forward(self.feed_forward_norm(h)))
         return x
 
-    def apply_tp(self, tp_mesh: DeviceMesh):
+    def apply_tp(self, tp_mesh: DeviceMesh, *, sequence_parallel: bool = False):
         """Apply Megatron-style tensor parallelism to this block.
 
         Activations stay full d_model. Only weight matrices are sharded.
 
         :param tp_mesh: tensor parallel DeviceMesh.
+        :param sequence_parallel: if True, keep intermediate activations in
+            sequence-parallel layout (reduce-scatter instead of all-reduce).
+            This saves communication but requires norms to handle sequence-parallel input.
+            Norms are excluded from FSDP sharding when this is enabled.
         """
         self.attention.apply_tp(tp_mesh)
         self.feed_forward.apply_tp(tp_mesh)
+        if sequence_parallel:
+            # OLMo-core pattern: wrap norms with SequenceParallel to handle
+            # sequence-partitioned activations correctly under FSDP.
+            # The actual sequence-parallel communication (reduce-scatter in
+            # rowwise, all-gather before colwise) is handled at the
+            # attention/FFN level.
+            self.attention_norm = SequenceParallel(self.attention_norm)
+            self.feed_forward_norm = SequenceParallel(self.feed_forward_norm)
 
     def apply_cp(self, cp_mesh: DeviceMesh, *, ring=None, uly=None):
         """Apply context parallelism via attention backend."""
@@ -167,6 +179,163 @@ class TransformerBlock(nn.Module):
         else:
             # Full: shard entire block
             fully_shard(self, **fsdp_kwargs)
+
+
+class MoEHybridTransformerBlock(nn.Module):
+    """Transformer block with dense FFN + MoE overlap.
+
+    When EP is enabled, this block overlaps the dense FFN computation with the
+    all-to-all MoE dispatch. This hides the a2a latency behind useful compute.
+
+    Execution order (with EP):
+        h = x + Attn(attn_norm(x))
+        route → dispatch tokens to experts      ← a2a starts
+        dense_h = DenseFFN(ffn_norm(h))          ← runs during a2a
+        expert_out = MoE.local_compute(...)       ← runs on local tokens
+        moe_out = MoE.combine(expert_out)         ← a2a combine
+        x = h + dense_h + moe_out + MoE.shared   ← combined residual
+
+    Without EP, falls back to sequential dense + MoE.
+
+    :param d_model: model dimensionality.
+    :param attention: pre-built attention module.
+    :param moe: pre-built MoEBase module (used as feed_forward).
+    :param dense_ffn: optional dense FeedForward for the overlap path.
+    :param attention_norm: pre-built norm before attention.
+    :param moe_norm: pre-built norm before MoE (replaces feed_forward_norm).
+    :param dense_norm: pre-built norm before dense FFN (if dense_ffn is set).
+    :param dropout: dropout on residual connections.
+    """
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        block_idx: int = 0,
+        n_layers: int = 1,
+        attention: Attention,
+        moe: MoEBase,
+        dense_ffn: Optional[FeedForward] = None,
+        attention_norm: Optional[RMSNorm] = None,
+        moe_norm: Optional[RMSNorm] = None,
+        dense_norm: Optional[RMSNorm] = None,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.block_idx = block_idx
+
+        self.attention_norm = attention_norm or RMSNorm(d_model)
+        self.attention = attention
+
+        # MoE path
+        self.moe = moe
+        self.moe_norm = moe_norm or RMSNorm(d_model)
+
+        # Optional dense FFN path (for overlap with MoE dispatch)
+        self.dense_ffn = dense_ffn
+        self.dense_norm = (
+            dense_norm or RMSNorm(d_model) if dense_ffn is not None else None
+        )
+
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        causal: bool = True,
+        attn_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        B, S, D = x.shape
+
+        # --- Attention ---
+        h = x + self.dropout(
+            self.attention(
+                self.attention_norm(x), causal=causal, attn_mask=attn_mask, **kwargs
+            )
+        )
+
+        # --- MoE route + dispatch (a2a starts) ---
+        x_flat, w_flat, i_flat, aux_loss, dropped, keep_mask = self.moe.route(
+            self.moe_norm(h)
+        )
+        local_x, local_w, local_i, combine_meta = self.moe.dispatch(
+            x_flat, i_flat, w_flat
+        )
+
+        # --- Dense FFN (overlaps with EP dispatch a2a) ---
+        dense_out = torch.zeros(B, S, D, device=x.device, dtype=x.dtype)
+        if self.dense_ffn is not None:
+            dense_out = self.dense_ffn(self.dense_norm(h))
+
+        # --- MoE local expert compute ---
+        expert_out = self.moe.local_compute(local_x, local_w, local_i)
+
+        # --- MoE combine (reverse a2a) ---
+        moe_flat = self.moe.combine(expert_out, combine_meta, x_flat, w_flat, i_flat)
+
+        # --- Reassemble into (B, S, D) ---
+        moe_out = self.moe.reassemble(
+            moe_flat, dropped=dropped, keep_mask=keep_mask, B=B, S=S, D=D
+        )
+
+        # --- Combined residual: attention + dense FFN + MoE ---
+        x = h + dense_out + moe_out
+        return x
+
+    @property
+    def feed_forward(self) -> MoEBase:
+        """Expose .feed_forward for Transformer.apply_ep compatibility."""
+        return self.moe
+
+    def apply_tp(self, tp_mesh: DeviceMesh):
+        self.attention.apply_tp(tp_mesh)
+        self.moe.ep = self.moe.ep  # MoE weights already support EP; TP on MoE expert weights is a separate concern
+        if self.dense_ffn is not None:
+            self.dense_ffn.apply_tp(tp_mesh)
+
+    def apply_cp(self, cp_mesh: DeviceMesh, *, ring=None, uly=None):
+        self.attention.apply_cp(cp_mesh, ring=ring, uly=uly)
+
+    def apply_fsdp(
+        self,
+        dp_mesh: Optional[DeviceMesh] = None,
+        *,
+        wrapping_strategy: str = "full",
+        reshard_after_forward: bool = True,
+        mp_policy: Optional[MixedPrecisionPolicy] = None,
+        prefetch_factor: int = 0,
+        router_mp_policy: Optional[MixedPrecisionPolicy] = None,
+        **fsdp_kwargs,
+    ):
+        if dp_mesh is None:
+            return
+
+        fsdp_kwargs.setdefault("mesh", dp_mesh)
+        if mp_policy is not None:
+            fsdp_kwargs["mp_policy"] = mp_policy
+        fsdp_kwargs["reshard_after_forward"] = reshard_after_forward
+
+        if wrapping_strategy == "fine_grained":
+            fsdp_att = fully_shard(self.attention, **fsdp_kwargs)
+            fsdp_moe = fully_shard(self.moe, **fsdp_kwargs)
+            fsdp_modules = [fsdp_att, fsdp_moe]
+            if self.dense_ffn is not None:
+                fsdp_dense = fully_shard(self.dense_ffn, **fsdp_kwargs)
+                fsdp_modules.append(fsdp_dense)
+            fsdp_root = fully_shard(self, **fsdp_kwargs)
+            if prefetch_factor > 0:
+                fsdp_root.set_modules_to_forward_prefetch([fsdp_att])
+                fsdp_att.set_modules_to_forward_prefetch(fsdp_modules[1:])
+        else:
+            fully_shard(self, **fsdp_kwargs)
+
+        # Router FP32 under FSDP (OLMo-core pattern)
+        if router_mp_policy is not None and hasattr(self.moe, "router"):
+            for param in self.moe.router.parameters():
+                param.data = param.data.to(router_mp_policy.param_dtype)
 
 
 class Transformer(nn.Module):
@@ -227,7 +396,9 @@ class Transformer(nn.Module):
 
         self.tie_word_embeddings = tie_word_embeddings
         if tie_word_embeddings:
-            self.lm_head.weight = self.embeddings.weight
+            # Avoid double-counting in FSDP: lm_head shares embedding weight
+            # via forward pass, not via Parameter aliasing.
+            self.lm_head = None
 
         # State flags
         self._pp_enabled = False
@@ -268,8 +439,11 @@ class Transformer(nn.Module):
         for block in self.blocks.values():
             x = block(x, **kwargs)
 
-        # LM head
-        logits = self.lm_head(x)
+        # LM head (may share embedding weight when tied)
+        if self.lm_head is not None:
+            logits = self.lm_head(x)
+        else:
+            logits = nn.functional.linear(x, self.embeddings.weight)
 
         output: dict[str, torch.Tensor] = {"logits": logits}
 
@@ -284,11 +458,15 @@ class Transformer(nn.Module):
             )
             output["loss"] = loss
 
-        # MoE aux losses
+        # MoE aux losses (works with both TransformerBlock and MoEHybridTransformerBlock)
         aux_loss = torch.tensor(0.0, device=x.device)
         for block in self.blocks.values():
-            if hasattr(block.feed_forward, "aux_loss"):
-                al = block.feed_forward.aux_loss
+            # TransformerBlock: feed_forward is MoEBase
+            ff = getattr(block, "feed_forward", None)
+            if ff is None and isinstance(block, MoEHybridTransformerBlock):
+                ff = block.moe
+            if ff is not None and hasattr(ff, "aux_loss"):
+                al = ff.aux_loss
                 if al is not None:
                     aux_loss = aux_loss + al
         if aux_loss.item() > 0:
@@ -324,6 +502,42 @@ class Transformer(nn.Module):
         for block in self.blocks.values():
             block.apply_cp(cp_mesh, ring=ring, uly=uly)
 
+    def replace_block_with_moe_hybrid(
+        self,
+        block_idx: int,
+        moe: MoEBase,
+        dense_ffn: Optional[FeedForward] = None,
+    ):
+        """Replace a standard TransformerBlock with MoEHybridTransformerBlock.
+
+        This is the OLMo-core pattern for post-hoc MoE conversion. The new block
+        inherits the existing attention and norms from the original block.
+
+        :param block_idx: 0-based index of the block to replace.
+        :param moe: pre-built MoEBase module.
+        :param dense_ffn: optional dense FeedForward for the overlap path.
+        """
+        key = str(block_idx)
+        old_block = self.blocks[key]
+        assert isinstance(old_block, TransformerBlock), (
+            f"Block {block_idx} is {type(old_block).__name__}, not TransformerBlock"
+        )
+
+        new_block = MoEHybridTransformerBlock(
+            d_model=self.d_model,
+            block_idx=block_idx,
+            n_layers=self.n_layers,
+            attention=old_block.attention,
+            moe=moe,
+            dense_ffn=dense_ffn,
+            attention_norm=old_block.attention_norm,
+            moe_norm=old_block.feed_forward_norm,
+            dropout=old_block.dropout.p
+            if isinstance(old_block.dropout, nn.Dropout)
+            else 0.0,
+        )
+        self.blocks[key] = new_block
+
     def apply_pp(self, pp_mesh: DeviceMesh):
         """Apply pipeline parallelism (marks model as PP-enabled).
 
@@ -334,13 +548,24 @@ class Transformer(nn.Module):
     def apply_ep(self, ep_config):
         """Apply Expert Parallelism to MoE layers in all blocks.
 
+        Works with both TransformerBlock (MoEBase as feed_forward) and
+        MoEHybridTransformerBlock (MoEBase as .moe).
+
         :param ep_config: ExpertParallelConfig with ep_size and ep_group.
         """
         from nanopsyche.model.moe import MoEBase, ExpertParallelConfig
 
         for block in self.blocks.values():
-            if isinstance(block.feed_forward, MoEBase):
+            # Standard TransformerBlock: feed_forward is MoEBase
+            if isinstance(block, TransformerBlock) and isinstance(
+                block.feed_forward, MoEBase
+            ):
                 block.feed_forward.ep = ep_config
+            # MoEHybridTransformerBlock: moe is MoEBase
+            elif isinstance(block, MoEHybridTransformerBlock) and isinstance(
+                block.moe, MoEBase
+            ):
+                block.moe.ep = ep_config
 
     def apply_fsdp(
         self,
@@ -375,17 +600,16 @@ class Transformer(nn.Module):
                 prefetch_factor=prefetch_factor,
             )
 
-        # Embeddings
-        if not self.tie_word_embeddings:
-            fully_shard(
-                self.embeddings,
-                mesh=dp_mesh,
-                reshard_after_forward=reshard_after_forward,
-                mp_policy=mp_policy,
-            )
+        # Embeddings (always shard individually for efficiency)
+        fully_shard(
+            self.embeddings,
+            mesh=dp_mesh,
+            reshard_after_forward=reshard_after_forward,
+            mp_policy=mp_policy,
+        )
 
-        # LM head
-        if not self.tie_word_embeddings:
+        # LM head (not shared with embeddings when tied)
+        if self.lm_head is not None:
             fully_shard(
                 self.lm_head,
                 mesh=dp_mesh,

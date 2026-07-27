@@ -51,6 +51,9 @@ class Callback:
         :param trainer: the Trainer instance.
         """
 
+    def post_log_metrics(self, trainer: Any) -> None:
+        """Called after metrics are dispatched to loggers."""
+
     def on_error(self, trainer: Any, exception: BaseException) -> None:
         """Called when training encounters an error."""
 

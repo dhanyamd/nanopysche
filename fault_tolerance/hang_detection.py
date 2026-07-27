@@ -130,34 +130,90 @@ class HangDetector:
 
 
 class HeartbeatCoordinator:
-    """Coordinate heartbeats across all ranks.
+    """Coordinate heartbeats across all ranks via all-reduce barrier.
 
-    Each rank periodically sends its heartbeat to rank 0.
-    Rank 0 monitors all heartbeats and detects hangs.
+    Instead of point-to-point heartbeats (which adds complexity), this uses
+    a periodic all-reduce barrier: all ranks participate in a lightweight
+    all-reduce every `check_interval` seconds. If a rank misses the barrier,
+    its peers detect the hang via timeout.
 
-    This is more robust than per-rank detection because it provides
-    a global view of the training state.
+    This is OLMo-core's pattern — simple, robust, no P2P state to manage.
+
+    Each rank:
+      1. Increments a local step counter
+      2. Periodically (every check_interval) does an all-reduce of the counter
+      3. Rank 0 verifies all ranks' counters advanced since last check
+
+    :param check_interval: seconds between heartbeat checks.
+    :param hang_timeout: seconds without progress before declaring hang.
+    :param group: process group for heartbeat collectives.
     """
 
-    def __init__(self, check_interval: float = 30.0):
+    def __init__(
+        self,
+        check_interval: float = 30.0,
+        hang_timeout: float = 120.0,
+        group: dist.ProcessGroup | None = None,
+    ):
         self.check_interval = check_interval
-        self._heartbeats = {}
+        self.hang_timeout = hang_timeout
+        self.group = group or dist.group.WORLD
+        self._step_counter = 0
+        self._last_check_counter = {
+            i: -1 for i in range(dist.get_world_size(self.group))
+        }
         self._running = False
+        self._thread: threading.Thread | None = None
 
-    def coordinator_loop(self):
-        """Run on rank 0: collect heartbeats and detect hangs."""
-        if not dist.is_initialized() or dist.get_rank() != 0:
-            return
+    def heartbeat(self):
+        """Call after each training step to increment local counter."""
+        self._step_counter += 1
 
+    def start(self):
+        """Start coordinator thread on rank 0."""
+        rank = dist.get_rank(self.group)
         self._running = True
+        if rank == 0:
+            self._last_check_counter = {
+                i: -1 for i in range(dist.get_world_size(self.group))
+            }
+            self._thread = threading.Thread(target=self._coordinator_loop, daemon=True)
+            self._thread.start()
+
+    def stop(self):
+        """Stop coordinator."""
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+
+    def sync_heartbeats(self):
+        """All ranks: broadcast step counters via all-gather."""
+        world = dist.get_world_size(self.group)
+        rank = dist.get_rank(self.group)
+        local_tensor = torch.tensor([self._step_counter], dtype=torch.long)
+        gathered = [torch.zeros(1, dtype=torch.long) for _ in range(world)]
+        dist.all_gather(gathered, local_tensor, group=self.group)
+        return {r: gathered[r].item() for r in range(world)}
+
+    def _coordinator_loop(self):
+        """Rank 0: periodically gather heartbeats and detect hangs."""
         while self._running:
             time.sleep(self.check_interval)
 
-            # Check for stale ranks
-            current_time = time.time()
-            for rank, last_time in self._heartbeats.items():
-                if current_time - last_time > self.check_interval * 3:
-                    print(
-                        f"[HeartbeatCoordinator] Rank {rank} appears hung: "
-                        f"{current_time - last_time:.1f}s since last heartbeat"
-                    )
+            try:
+                counters = self.sync_heartbeats()
+            except RuntimeError:
+                continue
+
+            for r, c in counters.items():
+                if c == self._last_check_counter[r]:
+                    elapsed_hint = self.check_interval * 2
+                    if elapsed_hint >= self.hang_timeout:
+                        print(
+                            f"[HeartbeatCoordinator] Rank {r} appears hung: "
+                            f"counter stuck at {c} for ~{elapsed_hint:.0f}s"
+                        )
+                        if dist.is_initialized():
+                            dist.destroy_process_group()
+                        break
+            self._last_check_counter = counters
