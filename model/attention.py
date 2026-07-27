@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from torch.distributed import DeviceMesh
 
 from nanopsyche.model.rope import RotaryEmbedding, RoPEScalingConfig, apply_rotary_emb
+from nanopsyche.model.tp_utils import differentiable_all_reduce
 
 if TYPE_CHECKING:
     pass
@@ -171,7 +172,15 @@ class Attention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        att = self.sdpa(q, k, v, causal=causal, attn_mask=attn_mask)
+        if hasattr(self, "_cp_module") and self._cp_module is not None:
+            # Context Parallelism: input is (B, S_local, H, D) shaped
+            # CP module handles the sequence-partitioned attention
+            att = self._cp_module(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            )
+            att = att.transpose(1, 2)
+        else:
+            att = self.sdpa(q, k, v, causal=causal, attn_mask=attn_mask)
         att = att.transpose(1, 2).reshape(B, S, n_heads_local * self.head_dim)
 
         if self.output_dropout is not None:
@@ -180,7 +189,7 @@ class Attention(nn.Module):
         out = self.w_out(att)
 
         if tp > 1:
-            dist.all_reduce(out, group=self._tp_group)
+            out = differentiable_all_reduce(out, self._tp_group, tp_size=tp)
 
         return out
 
@@ -229,5 +238,28 @@ class Attention(nn.Module):
         )
 
     def apply_cp(self, cp_mesh: DeviceMesh, *, ring=None, uly=None):
-        """Apply context parallelism via the attention backend."""
-        pass
+        """Apply context parallelism via Ring Attention or Ulysses.
+
+        Sets up the attention module to use sequence-partitioned KV with
+        the specified CP strategy. The actual CP logic runs inside forward()
+        when self._cp_module is set.
+
+        :param cp_mesh: context parallel DeviceMesh.
+        :param ring: if True, use Ring Attention (P2P KV exchange).
+        :param uly: if True, use Ulysses (all-to-all reshape).
+        """
+        from nanopsyche.distributed.context_parallel import RingAttention
+
+        cp_size = cp_mesh.size()
+        cp_group = cp_mesh.get_group()
+
+        use_ulysses = uly if uly is not None else False
+        use_zigzag = not use_ulysses  # zig-zag only for ring
+
+        self._cp_size = cp_size
+        self._cp_group = cp_group
+        self._cp_module = RingAttention(
+            group=cp_group,
+            use_ulysses=use_ulysses,
+            use_zigzag=use_zigzag,
+        )

@@ -23,6 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed import DeviceMesh
 
+from nanopsyche.model.tp_utils import differentiable_all_reduce
+
 
 class ActivationFunction(Enum):
     """Supported activation functions for gated FFNs."""
@@ -73,7 +75,7 @@ class FeedForward(nn.Module):
         out = self.w2(self._activation_fn(self.w1(x)) * self.w3(x))
 
         if self._tp_size > 1:
-            dist.all_reduce(out, group=self._tp_group)
+            out = differentiable_all_reduce(out, self._tp_group, tp_size=self._tp_size)
 
         return out
 

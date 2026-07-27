@@ -391,8 +391,8 @@ class Transformer(nn.Module):
 
     def apply_compile(self):
         """Apply torch.compile to each block."""
-        for block in self.blocks.values():
-            block = torch.compile(block)
+        for name, block in self.blocks.items():
+            self.blocks[name] = torch.compile(block)
         self._compile_enabled = True
 
     def apply_activation_checkpointing(

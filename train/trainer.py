@@ -1,20 +1,23 @@
-"""Trainer — production training loop with gradient accumulation.
+"""Trainer — production training loop with gradient accumulation and callbacks.
 
 Matches OLMo-core pattern:
     Trainer handles the loop, TrainModule handles model+optimizer.
+    Callbacks receive lifecycle hooks for metrics, profiling, monitoring.
 
 Reference: OLMo-core src/olmo_core/train/trainer.py
            OLMo-core src/olmo_core/train/train_module/transformer/train_module.py
 """
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+from nanopsyche.train.callbacks.base import Callback
 
 
 @dataclass
@@ -40,7 +43,7 @@ class TrainingConfig:
     @property
     def gradient_accumulation_steps(self) -> int:
         per_gpu = self.micro_batch_size * self.sequence_length
-        return self.global_batch_size // (per_gpu * self.dp_size)
+        return self.global_batch_size // (per_gpu * self.dp_world_size)
 
     @property
     def dp_size(self) -> int:
@@ -51,7 +54,14 @@ class Trainer:
     """Production training loop.
 
     Handles gradient accumulation, mixed precision, gradient clipping,
-    optimizer step, LR scheduling, and checkpointing.
+    optimizer step, LR scheduling, checkpointing, and callback lifecycle.
+
+    Callbacks are invoked at each training lifecycle point:
+        pre_train → [per_step: pre_load_batch → pre_step → post_train_batch
+                     → pre_optim_step → post_step] → post_train
+
+    Metrics are recorded via record_metric(), buffered per step,
+    then all-reduced across DP ranks and dispatched to callbacks' log_metrics().
 
     Reference: OLMo-core src/olmo_core/train/trainer.py
     """
@@ -63,14 +73,17 @@ class Trainer:
         optimizer: torch.optim.Optimizer,
         scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None,
         data_loader=None,
+        callbacks: Optional[List[Callback]] = None,
     ):
         self.config = config
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.data_loader = data_loader
+        self.callbacks = callbacks or []
         self.step = 0
         self.tokens_seen = 0
+        self._metrics: Dict[str, float] = {}
         self._setup_distributed()
 
     def _setup_distributed(self):
@@ -86,30 +99,149 @@ class Trainer:
         else:
             self.device = torch.device("cpu")
 
+    # ------------------------------------------------------------------ #
+    # Metric recording
+    # ------------------------------------------------------------------ #
+
+    def record_metric(self, name: str, value: Any) -> None:
+        """Record a metric value. Accumulated in _metrics, flushed each log cycle.
+
+        :param name: metric name (e.g. "train/CE loss").
+        :param value: scalar value or 0-dim tensor.
+        """
+        if isinstance(value, torch.Tensor):
+            value = value.item()
+        self._metrics[name] = float(value)
+
+    def _flush_metrics(self) -> None:
+        """All-reduce metrics across DP ranks and dispatch to callbacks.
+
+        All metrics are summed across ranks, then averaged.
+        Only rank 0 dispatches to callbacks.
+        """
+        if not self._metrics:
+            return
+
+        if not dist.is_initialized():
+            reduced = dict(self._metrics)
+        else:
+            # Stack all metric values into a tensor for a single all-reduce
+            names = sorted(self._metrics.keys())
+            values = torch.tensor(
+                [self._metrics[n] for n in names],
+                dtype=torch.float64,
+                device=self.device,
+            )
+            dist.all_reduce(values, op=dist.ReduceOp.SUM)
+            values /= dist.get_world_size()
+            reduced = {n: float(v) for n, v in zip(names, values.tolist())}
+
+        # Dispatch to callbacks (rank 0 only)
+        if self.is_main:
+            for cb in self.callbacks:
+                cb.pre_log_metrics(self)
+            for cb in self.callbacks:
+                cb.log_metrics(reduced, self.step, self)
+            for cb in self.callbacks:
+                cb.pre_log_metrics(self)
+
+        self._metrics.clear()
+
+    # ------------------------------------------------------------------ #
+    # Training loop
+    # ------------------------------------------------------------------ #
+
     def fit(self):
+        """Run the full training loop.
+
+        Calls callback lifecycle hooks at each point.
+        """
         self.model.train()
+
+        # pre_train callbacks
+        for cb in self.callbacks:
+            cb.pre_train(self)
+
         if self.is_main:
             print(f"Starting training: {self.config.max_steps} steps")
 
-        for step in range(self.config.max_steps):
-            step_start = time.time()
-            loss = self._train_step()
+        try:
+            for step in range(self.config.max_steps):
+                self.step = step
+                self._train_step_with_callbacks()
+        except KeyboardInterrupt:
+            if self.is_main:
+                print(f"\nInterrupted at step {self.step}")
+            for cb in self.callbacks:
+                cb.on_error(self, KeyboardInterrupt("training interrupted"))
+        except Exception as e:
+            for cb in self.callbacks:
+                cb.on_error(self, e)
+            raise
+        finally:
+            for cb in self.callbacks:
+                cb.close(self)
 
-            if self.config.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.config.max_grad_norm
-                )
+    def _train_step_with_callbacks(self) -> None:
+        """One full training step with callback hooks."""
+        # pre_load_batch
+        for cb in self.callbacks:
+            cb.pre_load_batch(self)
 
-            self.optimizer.step()
-            if self.scheduler is not None:
-                self.scheduler.step()
-            self.model.zero_grad(set_to_none=True)
+        # Forward + backward
+        step_start = time.time()
+        loss = self._train_step()
+        step_time = time.time() - step_start
 
-            step_time = time.time() - step_start
-            if self.is_main and step % self.config.log_interval == 0:
-                self._log_step(step, loss, step_time)
-            if self.is_main and step % self.config.save_interval == 0 and step > 0:
-                self._save_checkpoint(step)
+        # Record basic metrics
+        self.record_metric("train/CE loss", loss)
+        tokens_per_step = self.config.global_batch_size
+        self.record_metric("throughput/step_time (s)", step_time)
+
+        # post_train_batch (forward+backward done, before optim step)
+        for cb in self.callbacks:
+            cb.post_train_batch(self)
+
+        # Gradient clipping
+        if self.config.max_grad_norm > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.config.max_grad_norm
+            )
+            self.record_metric("optim/total grad norm", grad_norm)
+
+        # pre_optim_step
+        for cb in self.callbacks:
+            cb.pre_optim_step(self)
+
+        # Optimizer step
+        self.optimizer.step()
+        if self.scheduler is not None:
+            self.scheduler.step()
+
+        # Record LR
+        lr = self.optimizer.param_groups[0]["lr"]
+        self.record_metric("optim/LR", lr)
+
+        self.model.zero_grad(set_to_none=True)
+        self.tokens_seen += tokens_per_step
+        self.record_metric("throughput/total tokens", self.tokens_seen)
+
+        # post_step (full step complete)
+        for cb in self.callbacks:
+            cb.post_step(self)
+
+        # Flush metrics periodically
+        if self.is_main and self.step % self.config.log_interval == 0:
+            self._flush_metrics()
+            self._console_log(step_time)
+
+        # Checkpoint
+        if (
+            self.is_main
+            and self.step % self.config.save_interval == 0
+            and self.step > 0
+        ):
+            self._save_checkpoint(self.step)
 
     def _train_step(self) -> float:
         self.model.train()
@@ -132,25 +264,48 @@ class Trainer:
 
         return total_loss
 
+    def _console_log(self, step_time: float) -> None:
+        """Fallback console logging when no console callback is attached."""
+        # Check if a console logger callback already handles this
+        has_console = any(
+            type(cb).__name__ == "ConsoleLoggerCallback" for cb in self.callbacks
+        )
+        if has_console:
+            return
+
+        tokens_per_sec = self.config.global_batch_size / step_time
+        lr = self.optimizer.param_groups[0]["lr"]
+        print(
+            f"step={self.step:6d} | loss={self._metrics.get('train/CE loss', 0):.4f}"
+            f" | lr={lr:.2e} | tokens/s={tokens_per_sec:.0f} | time={step_time:.2f}s"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Batch generation
+    # ------------------------------------------------------------------ #
+
+    def get_vocab_size(self) -> int:
+        """Get vocab size from model for random batch generation."""
+        if hasattr(self.model, "vocab_size"):
+            return self.model.vocab_size
+        if hasattr(self.model, "embeddings"):
+            return self.model.embeddings.weight.shape[0]
+        return 32000
+
     def _get_batch(self) -> dict[str, torch.Tensor]:
         if self.data_loader is not None:
             return next(self.data_loader)
         B = self.config.micro_batch_size
         S = self.config.sequence_length
+        vocab_size = self.get_vocab_size()
         return {
-            "input_ids": torch.randint(0, 32000, (B, S)),
-            "labels": torch.randint(0, 32000, (B, S)),
+            "input_ids": torch.randint(0, vocab_size, (B, S)),
+            "labels": torch.randint(0, vocab_size, (B, S)),
         }
 
-    def _log_step(self, step: int, loss: float, step_time: float):
-        tokens_per_step = self.config.global_batch_size
-        self.tokens_seen += tokens_per_step
-        tokens_per_sec = tokens_per_step / step_time
-        lr = self.optimizer.param_groups[0]["lr"]
-        print(
-            f"step={step:6d} | loss={loss:.4f} | lr={lr:.2e} | "
-            f"tokens/s={tokens_per_sec:.0f} | time={step_time:.2f}s"
-        )
+    # ------------------------------------------------------------------ #
+    # Checkpointing
+    # ------------------------------------------------------------------ #
 
     def _save_checkpoint(self, step: int):
         save_dir = Path(self.config.save_dir)
@@ -164,7 +319,8 @@ class Trainer:
             checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
         path = save_dir / f"step_{step:06d}.pt"
         torch.save(checkpoint, path)
-        print(f"Saved checkpoint to {path}")
+        if self.is_main:
+            print(f"Saved checkpoint to {path}")
 
     def load_checkpoint(self, path: str):
         checkpoint = torch.load(path, map_location=self.device)
@@ -173,4 +329,5 @@ class Trainer:
         self.step = checkpoint["step"]
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        print(f"Resumed from step {self.step}")
+        if self.is_main:
+            print(f"Resumed from step {self.step}")
