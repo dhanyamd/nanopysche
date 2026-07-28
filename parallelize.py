@@ -40,6 +40,7 @@ from nanopsyche.distributed.fsdp import (
     apply_activation_checkpointing,
 )
 from nanopsyche.fp8.training import FP8Config, apply_fp8
+from nanopsyche.model.moe import MoEBase
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ def parallelize_model(
     pp_config: Optional[PipelineParallelConfig] = None,
     dp_config: Optional[DataParallelConfig] = None,
     fp8_config: Optional[FP8Config] = None,
+    moe_fp8_recipe: str = "none",
     compile_model: bool = False,
     ac_mode: Optional[str] = None,
     ac_block_interval: Optional[int] = None,
@@ -114,6 +116,15 @@ def parallelize_model(
 
             log.info("  Applying EP")
             model.apply_ep(get_ep_mesh(world_mesh))
+
+        # Apply FP8-Flow-MoE recipe to all MoE modules
+        if moe_fp8_recipe != "none":
+            log.info(f"  Applying FP8-Flow-MoE recipe: {moe_fp8_recipe}")
+            for module in model.modules():
+                if isinstance(module, MoEBase):
+                    module.apply_fp8_flow_moe(
+                        fp8_flow_moe=True, fp8_recipe=moe_fp8_recipe
+                    )
 
     # 6. Activation Checkpointing
     if ac_mode is not None:

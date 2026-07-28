@@ -139,6 +139,10 @@ class TransformerConfig(Config):
     tie_word_embeddings: bool = False
     dropout: float = 0.0
 
+    # FP8
+    fp8_flow_moe: bool = False
+    fp8_recipe: str = "none"
+
     # Parallelism
     tp_size: int = 1
     pp_size: int = 1

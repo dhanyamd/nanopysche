@@ -18,7 +18,7 @@ Reference: Fedus et al. 2021 (Switch Transformer)
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -464,6 +464,11 @@ class MoEConfig:
     """DeepSeek-V2 style: optional shared expert that processes all tokens."""
     ep: ExpertParallelConfig = field(default_factory=ExpertParallelConfig)
 
+    fp8_flow_moe: bool = False
+    """Enable FP8-Flow-MoE casting-free recipe for expert computation."""
+    fp8_recipe: str = "none"
+    """FP8 recipe: 'none', 'blockwise', 'mxfp8', 'flow_moe'."""
+
 
 class MoEBase(nn.Module):
     """Mixture of Experts layer.
@@ -496,6 +501,8 @@ class MoEBase(nn.Module):
         capacity_factor: Optional[float] = None,
         shared_expert: bool = False,
         ep: Optional[ExpertParallelConfig] = None,
+        fp8_flow_moe: bool = False,
+        fp8_recipe: str = "none",
     ):
         super().__init__()
         self.d_model = d_model
@@ -533,6 +540,25 @@ class MoEBase(nn.Module):
 
         # Use grouped_gemm if available
         self._use_grouped_gemm = _GROUPED_GEMM_AVAILABLE
+
+        # FP8-Flow-MoE
+        self.fp8_flow_moe_enabled = fp8_flow_moe
+        self._fp8_flow_moe = None
+        if fp8_flow_moe:
+            from nanopsyche.fp8.flow_moe import FP8FlowMoEConfig, FP8FlowMoECompute
+            from nanopsyche.fp8.recipes import FP8RecipeConfig, FP8RecipeType
+
+            recipe_config = FP8RecipeConfig(
+                enabled=True,
+                recipe_type=FP8RecipeType(fp8_recipe),
+            )
+            fm_config = FP8FlowMoEConfig(
+                enabled=True,
+                fp8_recipe=recipe_config,
+            )
+            self._fp8_flow_moe = FP8FlowMoECompute(
+                fm_config, d_model, self.hidden_size, num_experts
+            )
 
     def _init_weights(self):
         for w in [self.w1, self.w2, self.w3]:
@@ -632,10 +658,22 @@ class MoEBase(nn.Module):
         weights: torch.Tensor,
         indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute expert outputs using grouped_gemm (when available)."""
+        """Compute expert outputs using FP8-Flow-MoE or grouped_gemm fallback.
+
+        When FP8-Flow-MoE is enabled, uses the casting-free FP8 dataflow
+        with scaling-aware transpose (MLSys 2026). The entire MoE expert
+        computation stays in FP8 with only 2 cast operations.
+
+        When disabled, falls back to BF16 grouped_gemm (original behavior).
+        """
         num_tokens, D = x.shape
         output = torch.zeros_like(x)
 
+        # FP8-Flow-MoE path
+        if self.fp8_flow_moe_enabled and self._fp8_flow_moe is not None:
+            return self._fp8_flow_moe(x, weights, indices, 0, self.num_experts)
+
+        # BF16 fallback (original grouped_gemm path)
         for e_local in range(self.num_experts):
             mask = indices == e_local
             token_ids = mask.any(dim=-1).nonzero(as_tuple=True)[0]
@@ -653,7 +691,6 @@ class MoEBase(nn.Module):
             w2 = self.w2[e_local * h : (e_local + 1) * h]
             w3 = self.w3[e_local * h : (e_local + 1) * h]
 
-            # grouped_gemm path
             expert_out = (F.silu(token_x @ w1.T) * (token_x @ w3.T)) @ w2
             output[token_ids] += per_token_weight.unsqueeze(-1) * expert_out
 
@@ -665,16 +702,17 @@ class MoEBase(nn.Module):
         weights: torch.Tensor,
         indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute expert outputs using padded batched matmul.
+        """Compute expert outputs using padded batched matmul or FP8-Flow-MoE.
 
-        For each expert:
-            1. Find tokens assigned to this expert
-            2. Pad to power-of-2 for batched matmul
-            3. Compute SwiGLU via torch.bmm
-            4. Unpad and weight the output
+        When FP8-Flow-MoE is enabled, delegates to FP8-Flow-MoE compute.
+        Otherwise, uses the original padded batched matmul (BF16).
         """
         num_tokens, D = x.shape
         output = torch.zeros_like(x)
+
+        # FP8-Flow-MoE path
+        if self.fp8_flow_moe_enabled and self._fp8_flow_moe is not None:
+            return self._fp8_flow_moe(x, weights, indices, 0, self.num_experts)
 
         if self.ep.ep_size > 1:
             local_start, local_end = self.ep.local_experts(self.num_experts)
@@ -704,7 +742,6 @@ class MoEBase(nn.Module):
             w3 = self.w3[e_local * h : (e_local + 1) * h]
 
             x_3d = token_x.unsqueeze(0)
-            # SwiGLU: silu(x @ w1.T) * (x @ w3.T) @ w2
             gate = torch.bmm(x_3d, w1.T.unsqueeze(0)).squeeze(0)
             up = torch.bmm(x_3d, w3.T.unsqueeze(0)).squeeze(0)
             hidden = F.silu(gate) * up
@@ -832,6 +869,38 @@ class MoEBase(nn.Module):
             full_output[keep_mask] = output
             output = full_output
         return output.view(B, S, D)
+
+    def apply_fp8_flow_moe(
+        self,
+        fp8_flow_moe: bool = True,
+        fp8_recipe: str = "flow_moe",
+    ):
+        """Enable FP8-Flow-MoE post-construction.
+
+        Creates the FP8FlowMoECompute module and sets the flag.
+        Can be called after MoEBase is created, e.g. from parallelize_model().
+
+        :param fp8_flow_moe: enable FP8-Flow-MoE dataflow.
+        :param fp8_recipe: recipe name ('none', 'blockwise', 'mxfp8', 'flow_moe').
+        """
+        from nanopsyche.fp8.flow_moe import FP8FlowMoEConfig, FP8FlowMoECompute
+        from nanopsyche.fp8.recipes import FP8RecipeConfig, FP8RecipeType
+
+        self.fp8_flow_moe_enabled = fp8_flow_moe
+        if fp8_flow_moe:
+            recipe_config = FP8RecipeConfig(
+                enabled=True,
+                recipe_type=FP8RecipeType(fp8_recipe),
+            )
+            fm_config = FP8FlowMoEConfig(
+                enabled=True,
+                fp8_recipe=recipe_config,
+            )
+            self._fp8_flow_moe = FP8FlowMoECompute(
+                fm_config, self.d_model, self.hidden_size, self.num_experts
+            )
+        else:
+            self._fp8_flow_moe = None
 
     @property
     def aux_loss(self) -> Optional[torch.Tensor]:

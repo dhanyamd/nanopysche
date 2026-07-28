@@ -118,17 +118,33 @@ class Trainer:
             )
 
     def _setup_distributed(self):
-        if not dist.is_initialized():
-            backend = "nccl" if torch.cuda.is_available() else "gloo"
-            dist.init_process_group(backend=backend)
-        self.rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
-        self.is_main = self.rank == 0
+        self.rank = 0
+        self.world_size = 1
+        self.is_main = True
+        self.device = torch.device("cpu")
+
+        if not dist.is_available():
+            return
+
+        # Check if running under torchrun (RANK env var)
+        import os as _os
+
+        if "RANK" not in _os.environ:
+            return
+
+        try:
+            if not dist.is_initialized():
+                backend = "nccl" if torch.cuda.is_available() else "gloo"
+                dist.init_process_group(backend=backend)
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+            self.is_main = self.rank == 0
+        except Exception:
+            return
+
         if torch.cuda.is_available():
             self.device = torch.device(f"cuda:{self.rank % torch.cuda.device_count()}")
             torch.cuda.set_device(self.device)
-        else:
-            self.device = torch.device("cpu")
 
     # ------------------------------------------------------------------ #
     # Metric recording

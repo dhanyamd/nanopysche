@@ -101,11 +101,17 @@ class DistributedDataLoader:
         self.dataset = dataset
         self.batch_size = batch_size
 
-        # Use DistributedSampler for automatic sharding
-        sampler = data.distributed.DistributedSampler(
-            dataset,
-            shuffle=True,
-        )
+        # Use DistributedSampler when distributed is initialized,
+        # otherwise use a plain RandomSampler for single-GPU / CPU training.
+        if dist.is_initialized():
+            sampler = data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=dist.get_world_size(),
+                rank=dist.get_rank(),
+                shuffle=True,
+            )
+        else:
+            sampler = data.RandomSampler(dataset)
 
         self._loader = data.DataLoader(
             dataset,
@@ -125,7 +131,8 @@ class DistributedDataLoader:
 
     def set_epoch(self, epoch: int):
         """Set epoch for shuffling (important for training diversity)."""
-        self._loader.sampler.set_epoch(epoch)
+        if hasattr(self._loader.sampler, "set_epoch"):
+            self._loader.sampler.set_epoch(epoch)
 
 
 def create_distributed_loader(
