@@ -31,10 +31,11 @@ from typing import Iterator
 
 
 class DistributedDataset(data.Dataset):
-    """Simple distributed dataset with rank-based sharding.
+    """Simple distributed dataset.
 
-    Each rank gets a different shard of the data. The shard is determined
-    by the rank and world size, so no communication is needed.
+    Splits a flat token array into fixed-length sequences.
+    Sharding across ranks is handled by DistributedSampler in
+    DistributedDataLoader, NOT by rank-based slicing here.
 
     For real training, replace this with:
         - NumpyFSLDataset (OLMo-core): memory-mapped, fixed-sequence-length
@@ -46,19 +47,12 @@ class DistributedDataset(data.Dataset):
         self,
         data_source: torch.Tensor | np.ndarray,
         sequence_length: int = 2048,
-        rank: int = 0,
-        world_size: int = 1,
     ):
         self.sequence_length = sequence_length
 
-        # Shard data by rank
         if isinstance(data_source, torch.Tensor):
             data_source = data_source.numpy()
-        total_samples = len(data_source)
-        samples_per_rank = total_samples // world_size
-        start = rank * samples_per_rank
-        end = start + samples_per_rank
-        self.data = data_source[start:end]
+        self.data = data_source
 
         # Precompute number of sequences
         self.num_sequences = (len(self.data) - 1) // sequence_length
@@ -143,6 +137,9 @@ def create_distributed_loader(
 ) -> DistributedDataLoader:
     """Create a distributed data loader from raw data.
 
+    Sharding is handled by DistributedSampler inside DistributedDataLoader,
+    not by rank-based slicing here.
+
     Args:
         data_source: tokenized data as numpy array or torch tensor
         batch_size: microbatch size per GPU
@@ -152,10 +149,7 @@ def create_distributed_loader(
     Returns:
         DistributedDataLoader ready for training
     """
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-
-    dataset = DistributedDataset(data_source, sequence_length, rank, world_size)
+    dataset = DistributedDataset(data_source, sequence_length)
 
     return DistributedDataLoader(
         dataset,

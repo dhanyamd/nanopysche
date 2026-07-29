@@ -106,6 +106,7 @@ class Trainer:
         self.tokens_seen = 0
         self._metrics: Dict[str, float] = {}
         self._compressor = None
+        self._best_val_loss = float("inf")
         self._setup_distributed()
 
         # Gradient compression (DiLoCo)
@@ -261,6 +262,14 @@ class Trainer:
         # Record basic metrics
         self.record_metric("train/CE loss", loss)
         tokens_per_step = self.config.global_batch_size
+
+        # Perplexity = exp(loss)
+        try:
+            ppl = float(torch.exp(torch.tensor(loss)).item())
+        except (OverflowError, ValueError):
+            ppl = float("inf")
+        self.record_metric("train/PPL", ppl)
+
         self.record_metric("throughput/step_time (s)", step_time)
 
         # post_train_batch (forward+backward done, before optim step)
@@ -374,22 +383,21 @@ class Trainer:
 
     def _save_checkpoint(self, step: int):
         if self.checkpointer is not None:
-            # Production: atomic async save via DistributedCheckpointer
             self.checkpointer.save(
                 step=step,
                 model=self.model,
                 optimizer=self.optimizer,
                 scheduler=self.scheduler,
-                metrics=dict(self._metrics),
+                extra=dict(self._metrics) if self._metrics else None,
             )
         else:
-            # Fallback: simple torch.save
             save_dir = Path(self.config.save_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
             checkpoint = {
                 "step": step,
                 "model_state_dict": self.model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
+                "best_val_loss": self._best_val_loss,
             }
             if self.scheduler is not None:
                 checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
@@ -398,20 +406,34 @@ class Trainer:
             if self.is_main:
                 print(f"Saved checkpoint to {path}")
 
+        # Save best checkpoint if val loss improved
+        val_loss = self._metrics.get("eval/perplexity")
+        if val_loss is not None and val_loss < self._best_val_loss:
+            self._best_val_loss = val_loss
+            if self.checkpointer is None:
+                best_path = Path(self.config.save_dir) / "best.pt"
+                torch.save(
+                    {
+                        "step": step,
+                        "model_state_dict": self.model.state_dict(),
+                        "optimizer_state_dict": self.optimizer.state_dict(),
+                        "best_val_loss": self._best_val_loss,
+                    },
+                    best_path,
+                )
+                if self.is_main:
+                    print(
+                        f"Best checkpoint saved to {best_path} (val loss={self._best_val_loss:.4f})"
+                    )
+
     def load_checkpoint(self, path: str):
         if self.checkpointer is not None:
-            self.checkpointer.load(
-                path=path,
+            metadata = self.checkpointer.load(
                 model=self.model,
                 optimizer=self.optimizer,
                 scheduler=self.scheduler,
             )
-            self.step = (
-                self.checkpointer._metadata.step
-                if hasattr(self.checkpointer, "_metadata")
-                and self.checkpointer._metadata
-                else 0
-            )
+            self.step = metadata.get("step", 0)
             if self.is_main:
                 print(f"Resumed from step {self.step}")
             return
@@ -420,6 +442,7 @@ class Trainer:
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.step = checkpoint["step"]
+        self._best_val_loss = checkpoint.get("best_val_loss", float("inf"))
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         if self.is_main:

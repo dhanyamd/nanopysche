@@ -6,8 +6,10 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 import time as time_module
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -82,6 +84,71 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="Validation steps (samples to evaluate)",
+    )
+    train_p.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging",
+    )
+    train_p.add_argument(
+        "--wandb-project",
+        type=str,
+        default="nanopsyche",
+        help="WandB project name",
+    )
+    train_p.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Resume from checkpoint path",
+    )
+    train_p.add_argument(
+        "--save-dir",
+        type=str,
+        default=None,
+        help="Checkpoint save directory",
+    )
+    train_p.add_argument(
+        "--save-interval",
+        type=int,
+        default=1000,
+        help="Checkpoint save interval (steps)",
+    )
+    train_p.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="Tensor parallelism degree (shard weights along hidden dim)",
+    )
+    train_p.add_argument(
+        "--pp-size",
+        type=int,
+        default=1,
+        help="Pipeline parallelism degree (split layers across stages)",
+    )
+    train_p.add_argument(
+        "--cp-size",
+        type=int,
+        default=1,
+        help="Context parallelism degree (shard sequence across ranks)",
+    )
+    train_p.add_argument(
+        "--ep-size",
+        type=int,
+        default=1,
+        help="Expert parallelism degree (shard experts across ranks)",
+    )
+    train_p.add_argument(
+        "--fsdp",
+        action="store_true",
+        help="Enable FSDP (Fully Sharded Data Parallelism)",
+    )
+    train_p.add_argument(
+        "--ac-mode",
+        type=str,
+        default=None,
+        choices=["full", "selected_blocks"],
+        help="Activation checkpointing mode",
     )
 
     # bench
@@ -273,6 +340,96 @@ def cmd_train(args: argparse.Namespace):
     model, optimizer, scheduler, _ = config.build()
     model.to(args.device)
 
+    # --- MoE conversion (replace dense FFN blocks with MoEHybridTransformerBlock) ---
+    if args.use_moe:
+        from nanopsyche.model.moe import MoEBase as MoEBaseCLS
+
+        ffn_hidden = preset.get("ffn_hidden") or int(8 / 3 * preset["d_model"])
+        ffn_hidden = ((ffn_hidden + 255) // 256) * 256
+        # Replace every other block by default (standard MoE practice)
+        moe_interval = 2
+        for block_idx in range(preset["n_layers"]):
+            if block_idx % moe_interval == 0:
+                moe = MoEBaseCLS(
+                    d_model=preset["d_model"],
+                    hidden_size=ffn_hidden,
+                    num_experts=args.num_experts,
+                    top_k=args.top_k,
+                    fp8_flow_moe=(args.fp8_recipe == "flow_moe"),
+                    fp8_recipe=args.fp8_recipe,
+                ).to(args.device)
+                model.replace_block_with_moe_hybrid(block_idx, moe)
+
+    # --- Parallelism ---
+    has_parallelism = any(
+        [
+            args.tp_size > 1,
+            args.pp_size > 1,
+            args.cp_size > 1,
+            args.ep_size > 1,
+            args.fsdp,
+            args.ac_mode is not None,
+        ]
+    )
+
+    if has_parallelism:
+        import torch.distributed as dist
+
+        # Init process group if running under torchrun
+        if dist.is_available() and "RANK" in os.environ and not dist.is_initialized():
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+            dist.init_process_group(backend=backend)
+            args.device = torch.device(
+                f"cuda:{dist.get_rank() % torch.cuda.device_count()}"
+            )
+            torch.cuda.set_device(args.device)
+            model.to(args.device)
+
+        from nanopsyche.parallel import build_world_mesh
+        from nanopsyche.parallelize import parallelize_model
+        from nanopsyche.distributed.tensor_parallel import TensorParallelConfig
+        from nanopsyche.distributed.context_parallel import ContextParallelConfig
+        from nanopsyche.distributed.pipeline_parallel import PipelineParallelConfig
+        from nanopsyche.distributed.fsdp import DataParallelConfig
+
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        world_mesh = build_world_mesh(
+            world_size=world_size,
+            tp_size=args.tp_size,
+            pp_size=args.pp_size,
+            cp_size=args.cp_size,
+            ep_size=args.ep_size,
+            device_type=device_type,
+        )
+
+        tp_config = (
+            TensorParallelConfig(degree=args.tp_size) if args.tp_size > 1 else None
+        )
+        cp_config = (
+            ContextParallelConfig(degree=args.cp_size) if args.cp_size > 1 else None
+        )
+        pp_config = (
+            PipelineParallelConfig(degree=args.pp_size) if args.pp_size > 1 else None
+        )
+        dp_config = DataParallelConfig(name="fsdp") if args.fsdp else None
+
+        model = parallelize_model(
+            model,
+            world_mesh=world_mesh,
+            device=args.device,
+            tp_config=tp_config,
+            cp_config=cp_config,
+            pp_config=pp_config,
+            dp_config=dp_config,
+            moe_fp8_recipe=args.fp8_recipe,
+            compile_model=args.compile,
+            ac_mode=args.ac_mode,
+        )
+    else:
+        if args.compile:
+            model = torch.compile(model)
+
     model_config = {
         "num_params": sum(p.numel() for p in model.parameters()),
         "num_non_embed_params": sum(p.numel() for p in model.parameters())
@@ -287,11 +444,13 @@ def cmd_train(args: argparse.Namespace):
     if train_loader is not None:
         print(f"Data: {args.dataset}")
 
-    if args.compile:
-        model = torch.compile(model)
-        print("torch.compile enabled")
-
     from nanopsyche.train.trainer import TrainingConfig as TCT, Trainer
+    from nanopsyche.checkpoint.distributed import (
+        DistributedCheckpointer,
+        CheckpointConfig,
+    )
+
+    save_dir = args.save_dir or f"checkpoints/{args.model}"
 
     tc = TCT(
         global_batch_size=args.batch_size,
@@ -299,9 +458,51 @@ def cmd_train(args: argparse.Namespace):
         sequence_length=args.seq_len,
         learning_rate=args.lr,
         max_steps=args.max_steps,
+        save_interval=args.save_interval,
+        save_dir=save_dir,
         dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
     )
-    trainer = Trainer(tc, model, optimizer, scheduler, data_loader=train_loader)
+
+    checkpointer = DistributedCheckpointer(
+        CheckpointConfig(
+            save_dir=save_dir,
+            save_interval=args.save_interval,
+        )
+    )
+    trainer = Trainer(
+        tc,
+        model,
+        optimizer,
+        scheduler,
+        data_loader=train_loader,
+        checkpointer=checkpointer,
+    )
+
+    # Wire production callbacks
+    from nanopsyche.train.callbacks import (
+        ConsoleLoggerCallback,
+        SpeedMonitorCallback,
+        GPUMemoryMonitorCallback,
+        StabilityMonitorCallback,
+        WandBCallback,
+    )
+
+    trainer.callbacks.append(
+        SpeedMonitorCallback(
+            device=torch.device(args.device), batch_size=args.batch_size * args.seq_len
+        )
+    )
+    if args.device == "cuda":
+        trainer.callbacks.append(
+            GPUMemoryMonitorCallback(device=torch.device(args.device))
+        )
+    trainer.callbacks.append(StabilityMonitorCallback())
+    trainer.callbacks.append(ConsoleLoggerCallback())
+
+    if args.wandb:
+        trainer.callbacks.append(
+            WandBCallback(project=args.wandb_project, name=config.name)
+        )
 
     # Attach validation callback
     if val_loader is not None and args.val_interval > 0:
@@ -325,6 +526,21 @@ def cmd_train(args: argparse.Namespace):
                     )
 
         trainer.callbacks.append(ValidationCallback())
+
+    # Resume from checkpoint if requested
+    if args.resume:
+        resume_path = Path(args.resume)
+        if checkpointer is not None and resume_path.is_dir():
+            # Load from distributed checkpoint directory
+            metadata = checkpointer.load(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+            )
+            trainer.step = metadata.get("step", 0)
+            print(f"Resumed from checkpoint step {trainer.step}")
+        else:
+            trainer.load_checkpoint(args.resume)
 
     trainer.fit()
 
@@ -367,6 +583,26 @@ def cmd_bench(args: argparse.Namespace):
 
     model = config.model.build()
     model.to(args.device)
+
+    # --- MoE conversion for benchmark ---
+    if args.use_moe:
+        from nanopsyche.model.moe import MoEBase as MoEBaseCLS
+
+        ffn_hidden = preset.get("ffn_hidden") or int(8 / 3 * preset["d_model"])
+        ffn_hidden = ((ffn_hidden + 255) // 256) * 256
+        moe_interval = 2
+        for block_idx in range(preset["n_layers"]):
+            if block_idx % moe_interval == 0:
+                moe = MoEBaseCLS(
+                    d_model=preset["d_model"],
+                    hidden_size=ffn_hidden,
+                    num_experts=args.num_experts,
+                    top_k=args.top_k,
+                    fp8_flow_moe=(args.fp8_recipe == "flow_moe"),
+                    fp8_recipe=args.fp8_recipe,
+                ).to(args.device)
+                model.replace_block_with_moe_hybrid(block_idx, moe)
+
     model.train()
 
     num_params = sum(p.numel() for p in model.parameters())

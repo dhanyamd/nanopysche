@@ -83,18 +83,20 @@ def build_world_mesh(
 
     if world_size is None:
         import torch.distributed as dist
+
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
     # Auto-compute DP size
     if dp_size is None:
-        dp_size = world_size // (tp_size * pp_size * cp_size)
-        assert world_size == tp_size * pp_size * cp_size * dp_size, (
+        dp_size = world_size // (tp_size * pp_size * cp_size * ep_size)
+        assert world_size == tp_size * pp_size * cp_size * dp_size * ep_size, (
             f"world_size ({world_size}) must equal "
             f"tp_size ({tp_size}) * pp_size ({pp_size}) * "
-            f"cp_size ({cp_size}) * dp_size ({dp_size})"
+            f"cp_size ({cp_size}) * dp_size ({dp_size}) * "
+            f"ep_size ({ep_size})"
         )
 
-    # Build mesh dimensions: (pp, dp, cp, tp)
+    # Build mesh dimensions: (pp, dp, ep, cp, tp)
     mesh_shape = [pp_size]
     dim_names: List[str] = [MeshDimName.pp]
 
@@ -106,6 +108,10 @@ def build_world_mesh(
         mesh_shape.append(dp_size)
         dim_names.append(MeshDimName.dp)
 
+    if ep_size > 1:
+        mesh_shape.append(ep_size)
+        dim_names.append(MeshDimName.ep)
+
     if cp_size > 1:
         mesh_shape.append(cp_size)
         dim_names.append(MeshDimName.cp)
@@ -114,7 +120,9 @@ def build_world_mesh(
         mesh_shape.append(tp_size)
         dim_names.append(MeshDimName.tp)
 
-    mesh = init_device_mesh(device_type, tuple(mesh_shape), mesh_dim_names=tuple(dim_names))
+    mesh = init_device_mesh(
+        device_type, tuple(mesh_shape), mesh_dim_names=tuple(dim_names)
+    )
     log.info(f"Built device mesh: {dim_names} = {mesh_shape}")
 
     _WORLD_MESH = mesh

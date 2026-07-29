@@ -559,6 +559,7 @@ class MoEBase(nn.Module):
             self._fp8_flow_moe = FP8FlowMoECompute(
                 fm_config, d_model, self.hidden_size, num_experts
             )
+            self._fp8_flow_moe.set_weights(self.w1, self.w2, self.w3)
 
     def _init_weights(self):
         for w in [self.w1, self.w2, self.w3]:
@@ -899,6 +900,7 @@ class MoEBase(nn.Module):
             self._fp8_flow_moe = FP8FlowMoECompute(
                 fm_config, self.d_model, self.hidden_size, self.num_experts
             )
+            self._fp8_flow_moe.set_weights(self.w1, self.w2, self.w3)
         else:
             self._fp8_flow_moe = None
 
