@@ -82,21 +82,52 @@ def apply_activation_checkpointing(
     mode: str = "full",
     block_interval: Optional[int] = None,
 ) -> nn.Module:
-    """Apply activation checkpointing to a Transformer model.
+    """Apply activation checkpointing to a model.
 
-    :param model: the transformer model (must have .blocks as ModuleDict or ModuleList).
+    Uses per-block checkpointing when ``model.blocks`` exists (built-in Transformer).
+    Otherwise wraps each direct child module.
+
+    :param model: model to checkpoint.
     :param mode: "full" (every block), "selected_blocks" (every N-th).
     :param block_interval: for "selected_blocks" mode.
     """
+    blocks = getattr(model, "blocks", None)
+    if blocks is not None and hasattr(blocks, "named_children"):
+        if mode == "full":
+            for blk_name, blk in blocks.named_children():
+                blocks[blk_name] = ActivationCheckpointing(blk)
+        elif mode == "selected_blocks" and block_interval is not None:
+            for i, (blk_name, blk) in enumerate(blocks.named_children()):
+                if i % block_interval == 0:
+                    blocks[blk_name] = ActivationCheckpointing(blk)
+        return model
+
+    # Generic fallback: checkpoint each top-level child
     if mode == "full":
-        for name, block in model.named_children():
-            if name == "blocks":
-                for i, (blk_name, blk) in enumerate(block.named_children()):
-                    block[blk_name] = ActivationCheckpointing(blk)
-    elif mode == "selected_blocks" and block_interval is not None:
         for name, child in model.named_children():
-            if name == "blocks":
-                for i, (blk_name, blk) in enumerate(child.named_children()):
-                    if i % block_interval == 0:
-                        child[blk_name] = ActivationCheckpointing(blk)
+            if isinstance(child, nn.Module):
+                setattr(model, name, ActivationCheckpointing(child))
+    elif mode == "selected_blocks" and block_interval is not None:
+        for i, (name, child) in enumerate(model.named_children()):
+            if isinstance(child, nn.Module) and i % block_interval == 0:
+                setattr(model, name, ActivationCheckpointing(child))
+    return model
+
+
+def apply_generic_fsdp(
+    model: nn.Module,
+    dp_mesh,
+    *,
+    param_dtype: Optional[torch.dtype] = None,
+    reduce_dtype: torch.dtype = torch.float32,
+) -> nn.Module:
+    """Wrap any model with root-level FSDP2 when no ``apply_fsdp`` hook exists."""
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype or torch.bfloat16,
+        reduce_dtype=reduce_dtype,
+    )
+    fully_shard(model, mesh=dp_mesh, mp_policy=mp_policy)
+    log.info("Applied generic root FSDP wrap to %s", type(model).__name__)
     return model

@@ -142,6 +142,7 @@ class TransformerConfig(Config):
     # FP8
     fp8_flow_moe: bool = False
     fp8_recipe: str = "none"
+    fp8_gemm_threshold: int = 1000000
 
     # Parallelism
     tp_size: int = 1
@@ -240,22 +241,51 @@ class ExperimentConfig(Config):
     model: TransformerConfig = field(default_factory=TransformerConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     seed: int = 42
+    model_factory: Optional[str] = None
+    """Optional ``module.path:callable`` for a custom model builder."""
 
     def build(self, **kwargs):
-        model = self.model.build()
+        from nanopsyche.model_factory import ModelBuildContext, build_model
+
+        if self.model_factory:
+            ctx = ModelBuildContext(
+                vocab_size=self.model.vocab_size,
+                seq_len=self.model.max_seq_len,
+                device=kwargs.get("device", "cpu"),
+                model_preset="custom",
+                preset=None,
+                use_moe=self.model.use_moe,
+                num_experts=self.model.num_experts,
+                moe_top_k=self.model.moe_top_k,
+                fp8_recipe=self.model.fp8_recipe,
+                fp8_gemm_threshold=self.model.fp8_gemm_threshold,
+                dtype=kwargs.get("dtype", __import__("torch").float32),
+            )
+            model, factory_opt, factory_sched = build_model(
+                ctx, factory_spec=self.model_factory
+            )
+            optimizer = factory_opt
+            scheduler = factory_sched
+        else:
+            model = self.model.build()
+            optimizer = None
+            scheduler = None
+
         import torch.optim as optim
         from nanopsyche.train.scheduler import CosineWithWarmup
 
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=self.training.learning_rate,
-            weight_decay=self.training.weight_decay,
-            betas=(0.9, 0.95),
-        )
-        scheduler = CosineWithWarmup(
-            optimizer,
-            warmup_steps=self.training.warmup_steps,
-            max_steps=self.training.max_steps,
-        )
+        if optimizer is None:
+            optimizer = optim.AdamW(
+                model.parameters(),
+                lr=self.training.learning_rate,
+                weight_decay=self.training.weight_decay,
+                betas=(0.9, 0.95),
+            )
+        if scheduler is None:
+            scheduler = CosineWithWarmup(
+                optimizer,
+                warmup_steps=self.training.warmup_steps,
+                max_steps=self.training.max_steps,
+            )
         config = self.training.build()
         return model, optimizer, scheduler, config

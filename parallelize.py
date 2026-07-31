@@ -38,9 +38,16 @@ from nanopsyche.distributed.pipeline_parallel import PipelineParallelConfig
 from nanopsyche.distributed.fsdp import (
     DataParallelConfig,
     apply_activation_checkpointing,
+    apply_generic_fsdp,
 )
 from nanopsyche.fp8.training import FP8Config, apply_fp8
 from nanopsyche.model.moe import MoEBase
+from nanopsyche.model.protocol import (
+    unsupported_parallelism,
+    warn_unsupported_parallelism,
+)
+from nanopsyche.model.parallel_adapter import ensure_parallel_hooks
+from nanopsyche.parallel import MeshDimName
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +64,7 @@ def parallelize_model(
     dp_config: Optional[DataParallelConfig] = None,
     fp8_config: Optional[FP8Config] = None,
     moe_fp8_recipe: str = "none",
+    moe_fp8_gemm_threshold: int = 1000000,
     compile_model: bool = False,
     ac_mode: Optional[str] = None,
     ac_block_interval: Optional[int] = None,
@@ -81,6 +89,22 @@ def parallelize_model(
     :returns: model with all parallelism transforms applied.
     """
     log.info("Parallelizing model...")
+    model = ensure_parallel_hooks(model)
+
+    ep_requested = (
+        world_mesh.mesh_dim_names is not None
+        and MeshDimName.ep in world_mesh.mesh_dim_names
+    )
+    missing = unsupported_parallelism(
+        model,
+        tp=tp_config is not None,
+        cp=cp_config is not None,
+        pp=pp_config is not None,
+        ep=ep_requested,
+        fsdp=dp_config is not None,
+        compile_model=compile_model,
+    )
+    warn_unsupported_parallelism(model, missing)
 
     # 1. Pipeline Parallelism (split model into stages)
     if pp_config is not None:
@@ -109,8 +133,6 @@ def parallelize_model(
 
     # 5. Expert Parallelism (MoE only)
     if hasattr(model, "apply_ep") and world_mesh.mesh_dim_names is not None:
-        from nanopsyche.parallel import MeshDimName
-
         if MeshDimName.ep in world_mesh.mesh_dim_names:
             from nanopsyche.parallel import get_ep_mesh
 
@@ -123,7 +145,9 @@ def parallelize_model(
             for module in model.modules():
                 if isinstance(module, MoEBase):
                     module.apply_fp8_flow_moe(
-                        fp8_flow_moe=True, fp8_recipe=moe_fp8_recipe
+                        fp8_flow_moe=True,
+                        fp8_recipe=moe_fp8_recipe,
+                        fp8_gemm_threshold=moe_fp8_gemm_threshold,
                     )
 
     # 6. Activation Checkpointing
@@ -138,6 +162,9 @@ def parallelize_model(
         log.info("  Applying torch.compile")
         if hasattr(model, "apply_compile"):
             model.apply_compile()
+        else:
+            log.info("  Applying generic torch.compile on root module")
+            model = torch.compile(model)
 
     # 8. Data Parallelism (FSDP/DDP — MUST BE LAST)
     if dp_config is not None:
@@ -146,6 +173,13 @@ def parallelize_model(
         if hasattr(model, "apply_fsdp"):
             model.apply_fsdp(
                 dp_mesh=dp_mesh,
+                param_dtype=dp_config.param_dtype,
+                reduce_dtype=dp_config.reduce_dtype,
+            )
+        else:
+            apply_generic_fsdp(
+                model,
+                dp_mesh,
                 param_dtype=dp_config.param_dtype,
                 reduce_dtype=dp_config.reduce_dtype,
             )

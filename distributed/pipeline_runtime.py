@@ -28,6 +28,12 @@ else:
 
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from nanopsyche.model.parallel_adapter import (
+    EMBED_ATTRS,
+    HEAD_ATTRS,
+    find_layer_stack,
+)
+
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -158,6 +164,48 @@ class PipelineParallelConfig:
         raise ValueError(f"Unknown split style: {self.split_style}")
 
 
+def _strip_embeddings(model_chunk: nn.Module) -> None:
+    for attr in EMBED_ATTRS:
+        if getattr(model_chunk, attr, None) is not None:
+            setattr(model_chunk, attr, None)
+    if hasattr(model_chunk, "embedding_norm"):
+        model_chunk.embedding_norm = None
+
+
+def _strip_lm_head(model_chunk: nn.Module) -> None:
+    for attr in HEAD_ATTRS:
+        if getattr(model_chunk, attr, None) is not None:
+            setattr(model_chunk, attr, None)
+
+
+def _filter_layer_stack(
+    model_chunk: nn.Module,
+    start_layer: Optional[int],
+    stop_layer: Optional[int],
+) -> None:
+    found = find_layer_stack(model_chunk)
+    if found is None:
+        return
+
+    attr, container = found
+    if isinstance(container, nn.ModuleDict):
+        keys = sorted(container.keys(), key=lambda k: int(k) if str(k).isdigit() else k)
+        for block_idx, key in enumerate(keys):
+            if start_layer is not None and block_idx < start_layer:
+                del container[key]
+            elif stop_layer is not None and block_idx >= stop_layer:
+                del container[key]
+    else:
+        kept = nn.ModuleList()
+        for block_idx, layer in enumerate(container):
+            if start_layer is not None and block_idx < start_layer:
+                continue
+            if stop_layer is not None and block_idx >= stop_layer:
+                continue
+            kept.append(layer)
+        setattr(model_chunk, attr, kept)
+
+
 def split_model(
     model: nn.Module,
     *,
@@ -166,30 +214,21 @@ def split_model(
     device: torch.device,
     pp_group: Optional[dist.ProcessGroup] = None,
 ) -> Tuple[List[PipelineStage], List[nn.Module]]:
-    """Split a Transformer model into pipeline stages.
+    """Split a model into pipeline stages via deepcopy + layer deletion.
 
-    Each rank gets one or more model chunks (stages). The split is done by
-    deepcopying the model and deleting layers outside the stage's range.
-
-    This follows OLMo-core's pattern: deepcopy + layer deletion (not tracer-based).
-
-    :param model: the full Transformer model.
-    :param pp_config: pipeline parallelism configuration.
-    :param pp_rank: this rank's index within the PP group.
-    :param device: device to place stages on.
-    :param pp_group: process group for PP communication.
-    :returns: (list of PipelineStage, list of model chunks).
+    Supports layer stacks named ``blocks``, ``layers``, ``layer``, or ``h``
+    (``ModuleDict`` or ``ModuleList``).
     """
     if not isinstance(model, nn.Module):
         raise TypeError(f"Expected nn.Module, got {type(model)}")
 
-    # Find the number of transformer layers
-    if hasattr(model, "blocks") and isinstance(model.blocks, nn.ModuleDict):
-        n_layers = len(model.blocks)
-    else:
+    found = find_layer_stack(model)
+    if found is None:
         raise ValueError(
-            "Model must have a 'blocks' attribute (nn.ModuleDict of transformer blocks)"
+            "Model must expose a layer stack as .blocks, .layers, .layer, or .h "
+            "(ModuleDict or ModuleList with at least one layer)."
         )
+    n_layers = len(found[1])
 
     split_points = pp_config.get_split_points(n_layers)
     num_stages = len(split_points) + 1
@@ -240,35 +279,14 @@ def _build_stage(
     """
     model_chunk = copy.deepcopy(model)
 
-    # Strip embeddings on non-first stages
     if not is_first:
-        model_chunk.embeddings = None
-        if hasattr(model_chunk, "embedding_norm"):
-            model_chunk.embedding_norm = None
+        _strip_embeddings(model_chunk)
 
-    # Keep only the contiguous layer range [start_layer, stop_layer)
-    if hasattr(model_chunk, "blocks") and isinstance(model_chunk.blocks, nn.ModuleDict):
-        drop_layers = start_layer is not None
-        blocks_to_keep = []
-        for block_idx in range(len(model_chunk.blocks)):
-            block_key = str(block_idx)
-            if block_idx == start_layer:
-                drop_layers = False
-            if block_idx == stop_layer:
-                drop_layers = True
-            if not drop_layers:
-                blocks_to_keep.append((block_key, model_chunk.blocks[block_key]))
-            else:
-                del model_chunk.blocks[block_key]
+    _filter_layer_stack(model_chunk, start_layer, stop_layer)
 
-        # Re-index blocks if needed (not strictly necessary, but clean)
-        # Keep original keys for compatibility with apply_tp/apply_fsdp
-
-    # Strip LM head on non-last stages
     if not is_last:
-        model_chunk.lm_head = None
+        _strip_lm_head(model_chunk)
 
-    # Move to device
     model_chunk = model_chunk.to(device)
 
     stage = PipelineStage(

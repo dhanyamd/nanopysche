@@ -30,6 +30,8 @@ from nanopsyche.model import (
 )
 from nanopsyche.train import Trainer
 from nanopsyche.config import ExperimentConfig, TransformerConfig, TrainingConfig
+from nanopsyche.model_factory import ModelBuildContext, build_model, load_factory
+from nanopsyche.model.parallel_adapter import ensure_parallel_hooks
 
 __version__ = "0.1.0"
 
@@ -44,4 +46,8 @@ __all__ = [
     "ExperimentConfig",
     "TransformerConfig",
     "TrainingConfig",
+    "ModelBuildContext",
+    "build_model",
+    "load_factory",
+    "ensure_parallel_hooks",
 ]

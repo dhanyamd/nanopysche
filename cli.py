@@ -53,6 +53,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="FP8 training recipe",
     )
     common.add_argument(
+        "--fp8-gemm-threshold",
+        type=int,
+        default=1000000,
+        help=(
+            "Min tokens/expert before FP8 GEMM beats BF16 bmm "
+            "(FP8-Flow-MoE adaptive routing). 0 forces FP8 GEMM always."
+        ),
+    )
+    common.add_argument(
         "--batch-size", type=int, default=4, help="Micro batch size per GPU"
     )
     common.add_argument("--seq-len", type=int, default=2048, help="Sequence length")
@@ -69,6 +78,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     common.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     common.add_argument("--max-steps", type=int, default=100, help="Training steps")
+    common.add_argument(
+        "--model-factory",
+        type=str,
+        default=None,
+        metavar="MODULE:CALLABLE",
+        help=(
+            "Custom model factory (e.g. my_pkg.models:build_model). "
+            "Receives ModelBuildContext; returns nn.Module or (model, opt, sched). "
+            "When omitted, uses the built-in Transformer preset from --model."
+        ),
+    )
 
     # train
     train_p = sub.add_parser("train", parents=[common], help="Train a model")
@@ -296,10 +316,141 @@ def compute_val_perplexity(model, val_loader, max_batches: int, device: str) -> 
     return float(torch.exp(torch.tensor(avg_loss)).item())
 
 
-def cmd_train(args: argparse.Namespace):
-    from nanopsyche.config import TransformerConfig, TrainingConfig, ExperimentConfig
+def _model_build_context(args: argparse.Namespace, vocab_size: int):
+    from nanopsyche.model_factory import ModelBuildContext
 
-    preset = MODEL_PRESETS[args.model]
+    factory_spec = getattr(args, "model_factory", None)
+    preset = None if factory_spec else MODEL_PRESETS[args.model]
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+    return ModelBuildContext(
+        vocab_size=vocab_size,
+        seq_len=args.seq_len,
+        device=args.device,
+        model_preset=args.model,
+        preset=preset,
+        use_moe=args.use_moe,
+        num_experts=args.num_experts,
+        moe_top_k=args.top_k,
+        fp8_recipe=args.fp8_recipe,
+        fp8_gemm_threshold=args.fp8_gemm_threshold,
+        dtype=dtype,
+    )
+
+
+def _build_optimizer_and_scheduler(
+    model, args: argparse.Namespace, factory_opt=None, factory_sched=None
+):
+    import torch.optim as optim
+    from nanopsyche.train.scheduler import CosineWithWarmup
+
+    if factory_opt is not None:
+        optimizer = factory_opt
+        scheduler = factory_sched or CosineWithWarmup(
+            optimizer,
+            warmup_steps=min(10, args.max_steps // 10),
+            max_steps=args.max_steps,
+        )
+        return optimizer, scheduler
+
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=0.1,
+        betas=(0.9, 0.95),
+    )
+    scheduler = CosineWithWarmup(
+        optimizer,
+        warmup_steps=min(10, args.max_steps // 10),
+        max_steps=args.max_steps,
+    )
+    return optimizer, scheduler
+
+
+def _maybe_parallelize_model(model, args: argparse.Namespace):
+    tp_size = getattr(args, "tp_size", 1)
+    pp_size = getattr(args, "pp_size", 1)
+    cp_size = getattr(args, "cp_size", 1)
+    ep_size = getattr(args, "ep_size", 1)
+    fsdp = getattr(args, "fsdp", False)
+    ac_mode = getattr(args, "ac_mode", None)
+    compile_model = getattr(args, "compile", False)
+
+    has_parallelism = any(
+        [
+            tp_size > 1,
+            pp_size > 1,
+            cp_size > 1,
+            ep_size > 1,
+            fsdp,
+            ac_mode is not None,
+        ]
+    )
+
+    if not has_parallelism:
+        if compile_model:
+            if hasattr(model, "apply_compile"):
+                model.apply_compile()
+            else:
+                model = torch.compile(model)
+        return model
+
+    import torch.distributed as dist
+
+    if dist.is_available() and "RANK" in os.environ and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+        args.device = torch.device(
+            f"cuda:{dist.get_rank() % torch.cuda.device_count()}"
+        )
+        if torch.cuda.is_available():
+            torch.cuda.set_device(args.device)
+        model.to(args.device)
+
+    from nanopsyche.parallel import build_world_mesh
+    from nanopsyche.parallelize import parallelize_model
+    from nanopsyche.distributed.tensor_parallel import TensorParallelConfig
+    from nanopsyche.distributed.context_parallel import ContextParallelConfig
+    from nanopsyche.distributed.pipeline_parallel import PipelineParallelConfig
+    from nanopsyche.distributed.fsdp import DataParallelConfig
+
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    world_mesh = build_world_mesh(
+        world_size=world_size,
+        tp_size=tp_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        ep_size=ep_size,
+        device_type=device_type,
+    )
+
+    tp_config = TensorParallelConfig(degree=tp_size) if tp_size > 1 else None
+    cp_config = ContextParallelConfig(degree=cp_size) if cp_size > 1 else None
+    pp_config = PipelineParallelConfig(degree=pp_size) if pp_size > 1 else None
+    dp_config = DataParallelConfig(name="fsdp") if fsdp else None
+
+    return parallelize_model(
+        model,
+        world_mesh=world_mesh,
+        device=args.device,
+        tp_config=tp_config,
+        cp_config=cp_config,
+        pp_config=pp_config,
+        dp_config=dp_config,
+        moe_fp8_recipe=args.fp8_recipe,
+        moe_fp8_gemm_threshold=args.fp8_gemm_threshold,
+        compile_model=compile_model,
+        ac_mode=ac_mode,
+    )
+
+
+def cmd_train(args: argparse.Namespace):
+    from nanopsyche.config import TrainingConfig, ExperimentConfig
+    from nanopsyche.model_factory import build_model
+    from nanopsyche.model.protocol import count_parameters, model_display_name
+
+    factory_spec = getattr(args, "model_factory", None)
 
     # Load data first to get actual vocab_size
     train_loader, val_loader, vocab_size = load_dataset(
@@ -312,22 +463,8 @@ def cmd_train(args: argparse.Namespace):
         vocab_size = 32000
 
     config = ExperimentConfig(
-        name=f"train-{args.model}",
-        model=TransformerConfig(
-            vocab_size=vocab_size,
-            d_model=preset["d_model"],
-            n_layers=preset["n_layers"],
-            n_heads=preset["n_heads"],
-            n_kv_heads=preset.get("n_kv_heads"),
-            ffn_hidden=preset.get("ffn_hidden"),
-            max_seq_len=args.seq_len,
-            rope_base=500000.0,
-            use_moe=args.use_moe,
-            num_experts=args.num_experts if args.use_moe else 0,
-            moe_top_k=args.top_k if args.use_moe else 0,
-            fp8_flow_moe=(args.fp8_recipe == "flow_moe"),
-            fp8_recipe=args.fp8_recipe,
-        ),
+        name=f"train-{args.model}" if not factory_spec else f"train-custom",
+        model_factory=factory_spec,
         training=TrainingConfig(
             micro_batch_size=args.batch_size,
             sequence_length=args.seq_len,
@@ -337,106 +474,18 @@ def cmd_train(args: argparse.Namespace):
         ),
     )
 
-    model, optimizer, scheduler, _ = config.build()
+    ctx = _model_build_context(args, vocab_size)
+    model, factory_opt, factory_sched = build_model(ctx, factory_spec=factory_spec)
     model.to(args.device)
-
-    # --- MoE conversion (replace dense FFN blocks with MoEHybridTransformerBlock) ---
-    if args.use_moe:
-        from nanopsyche.model.moe import MoEBase as MoEBaseCLS
-
-        ffn_hidden = preset.get("ffn_hidden") or int(8 / 3 * preset["d_model"])
-        ffn_hidden = ((ffn_hidden + 255) // 256) * 256
-        # Replace every other block by default (standard MoE practice)
-        moe_interval = 2
-        for block_idx in range(preset["n_layers"]):
-            if block_idx % moe_interval == 0:
-                moe = MoEBaseCLS(
-                    d_model=preset["d_model"],
-                    hidden_size=ffn_hidden,
-                    num_experts=args.num_experts,
-                    top_k=args.top_k,
-                    fp8_flow_moe=(args.fp8_recipe == "flow_moe"),
-                    fp8_recipe=args.fp8_recipe,
-                ).to(args.device)
-                model.replace_block_with_moe_hybrid(block_idx, moe)
-
-    # --- Parallelism ---
-    has_parallelism = any(
-        [
-            args.tp_size > 1,
-            args.pp_size > 1,
-            args.cp_size > 1,
-            args.ep_size > 1,
-            args.fsdp,
-            args.ac_mode is not None,
-        ]
+    optimizer, scheduler = _build_optimizer_and_scheduler(
+        model, args, factory_opt, factory_sched
     )
+    model = _maybe_parallelize_model(model, args)
 
-    if has_parallelism:
-        import torch.distributed as dist
+    model_config = count_parameters(model)
+    display = model_display_name(model, args.model if not factory_spec else None)
 
-        # Init process group if running under torchrun
-        if dist.is_available() and "RANK" in os.environ and not dist.is_initialized():
-            backend = "nccl" if torch.cuda.is_available() else "gloo"
-            dist.init_process_group(backend=backend)
-            args.device = torch.device(
-                f"cuda:{dist.get_rank() % torch.cuda.device_count()}"
-            )
-            torch.cuda.set_device(args.device)
-            model.to(args.device)
-
-        from nanopsyche.parallel import build_world_mesh
-        from nanopsyche.parallelize import parallelize_model
-        from nanopsyche.distributed.tensor_parallel import TensorParallelConfig
-        from nanopsyche.distributed.context_parallel import ContextParallelConfig
-        from nanopsyche.distributed.pipeline_parallel import PipelineParallelConfig
-        from nanopsyche.distributed.fsdp import DataParallelConfig
-
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        device_type = "cuda" if torch.cuda.is_available() else "cpu"
-        world_mesh = build_world_mesh(
-            world_size=world_size,
-            tp_size=args.tp_size,
-            pp_size=args.pp_size,
-            cp_size=args.cp_size,
-            ep_size=args.ep_size,
-            device_type=device_type,
-        )
-
-        tp_config = (
-            TensorParallelConfig(degree=args.tp_size) if args.tp_size > 1 else None
-        )
-        cp_config = (
-            ContextParallelConfig(degree=args.cp_size) if args.cp_size > 1 else None
-        )
-        pp_config = (
-            PipelineParallelConfig(degree=args.pp_size) if args.pp_size > 1 else None
-        )
-        dp_config = DataParallelConfig(name="fsdp") if args.fsdp else None
-
-        model = parallelize_model(
-            model,
-            world_mesh=world_mesh,
-            device=args.device,
-            tp_config=tp_config,
-            cp_config=cp_config,
-            pp_config=pp_config,
-            dp_config=dp_config,
-            moe_fp8_recipe=args.fp8_recipe,
-            compile_model=args.compile,
-            ac_mode=args.ac_mode,
-        )
-    else:
-        if args.compile:
-            model = torch.compile(model)
-
-    model_config = {
-        "num_params": sum(p.numel() for p in model.parameters()),
-        "num_non_embed_params": sum(p.numel() for p in model.parameters())
-        - (model.embeddings.weight.numel() if hasattr(model, "embeddings") else 0),
-    }
-
-    print(f"\nModel: {args.model} ({model_config['num_params'] // 1000**2}M params)")
+    print(f"\nModel: {display} ({model_config['num_params'] // 1000**2}M params)")
     print(f"MoE: {args.use_moe} | Experts: {args.num_experts} | Top-k: {args.top_k}")
     print(f"FP8: {args.fp8_recipe} | Batch: {args.batch_size} | Seq: {args.seq_len}")
     print(f"Steps: {args.max_steps} | LR: {args.lr} | Device: {args.device}")
@@ -546,11 +595,12 @@ def cmd_train(args: argparse.Namespace):
 
 
 def cmd_bench(args: argparse.Namespace):
-    from nanopsyche.config import TransformerConfig, ExperimentConfig
     from nanopsyche.bench_utils import get_peak_flops
+    from nanopsyche.model_factory import build_model
+    from nanopsyche.model.protocol import count_parameters, model_display_name
 
     torch.manual_seed(42)
-    preset = MODEL_PRESETS[args.model]
+    factory_spec = getattr(args, "model_factory", None)
 
     # Load data first to get actual vocab_size (needed for model construction)
     train_loader, val_loader, vocab_size = load_dataset(
@@ -562,53 +612,16 @@ def cmd_bench(args: argparse.Namespace):
     if vocab_size is None:
         vocab_size = 32000
 
-    config = ExperimentConfig(
-        name=f"bench-{args.model}",
-        model=TransformerConfig(
-            vocab_size=vocab_size,
-            d_model=preset["d_model"],
-            n_layers=preset["n_layers"],
-            n_heads=preset["n_heads"],
-            n_kv_heads=preset.get("n_kv_heads"),
-            ffn_hidden=preset.get("ffn_hidden"),
-            max_seq_len=args.seq_len,
-            rope_base=500000.0,
-            use_moe=args.use_moe,
-            num_experts=args.num_experts if args.use_moe else 0,
-            moe_top_k=args.top_k if args.use_moe else 0,
-            fp8_flow_moe=(args.fp8_recipe == "flow_moe"),
-            fp8_recipe=args.fp8_recipe,
-        ),
-    )
-
-    model = config.model.build()
+    ctx = _model_build_context(args, vocab_size)
+    model, _, _ = build_model(ctx, factory_spec=factory_spec)
     model.to(args.device)
-
-    # --- MoE conversion for benchmark ---
-    if args.use_moe:
-        from nanopsyche.model.moe import MoEBase as MoEBaseCLS
-
-        ffn_hidden = preset.get("ffn_hidden") or int(8 / 3 * preset["d_model"])
-        ffn_hidden = ((ffn_hidden + 255) // 256) * 256
-        moe_interval = 2
-        for block_idx in range(preset["n_layers"]):
-            if block_idx % moe_interval == 0:
-                moe = MoEBaseCLS(
-                    d_model=preset["d_model"],
-                    hidden_size=ffn_hidden,
-                    num_experts=args.num_experts,
-                    top_k=args.top_k,
-                    fp8_flow_moe=(args.fp8_recipe == "flow_moe"),
-                    fp8_recipe=args.fp8_recipe,
-                ).to(args.device)
-                model.replace_block_with_moe_hybrid(block_idx, moe)
-
+    model = _maybe_parallelize_model(model, args)
     model.train()
 
-    num_params = sum(p.numel() for p in model.parameters())
-    num_non_embed = num_params - (
-        model.embeddings.weight.numel() if hasattr(model, "embeddings") else 0
-    )
+    model_config = count_parameters(model)
+    display = model_display_name(model, args.model if not factory_spec else None)
+    num_params = model_config["num_params"]
+    num_non_embed = model_config["num_non_embed_params"]
 
     B, S = args.batch_size, args.seq_len
     x = torch.randint(0, vocab_size, (B, S), device=args.device)
@@ -641,14 +654,26 @@ def cmd_bench(args: argparse.Namespace):
 
     device = torch.device(args.device)
     peak = get_peak_flops(device, fp8=(args.fp8_recipe != "none"))
+
+    if factory_spec:
+        bench_preset = {
+            "n_layers": getattr(model, "n_layers", 1),
+            "d_model": getattr(model, "d_model", 768),
+            "ffn_hidden": getattr(model, "ffn_hidden", 2048),
+            "n_heads": getattr(model, "n_heads", 12),
+        }
+    else:
+        bench_preset = MODEL_PRESETS[args.model]
+
     mfu = compute_mfu(
         step_time_seconds=step_time,
         tokens_per_step=tokens_per_step,
         num_params=num_params,
-        n_layers=preset["n_layers"],
-        d_model=preset["d_model"],
-        ffn_hidden=preset["ffn_hidden"],
-        n_heads=preset["n_heads"],
+        n_layers=bench_preset["n_layers"],
+        d_model=bench_preset["d_model"],
+        ffn_hidden=bench_preset.get("ffn_hidden")
+        or int(8 / 3 * bench_preset["d_model"]),
+        n_heads=bench_preset["n_heads"],
         seq_len=S,
         batch_size=B,
         device=device,
@@ -660,7 +685,7 @@ def cmd_bench(args: argparse.Namespace):
 
     print(f"\n{'=' * 65}")
     print(
-        f"  Model:      {args.model} ({num_params // 1000**2}M total, {num_non_embed // 1000**2}M non-embed)"
+        f"  Model:      {display} ({num_params // 1000**2}M total, {num_non_embed // 1000**2}M non-embed)"
     )
     print(
         f"  MoE:        {args.use_moe} | Experts: {args.num_experts} | Top-k: {args.top_k}"

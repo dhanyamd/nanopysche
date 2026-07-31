@@ -468,6 +468,8 @@ class MoEConfig:
     """Enable FP8-Flow-MoE casting-free recipe for expert computation."""
     fp8_recipe: str = "none"
     """FP8 recipe: 'none', 'blockwise', 'mxfp8', 'flow_moe'."""
+    fp8_gemm_threshold: int = 1000000
+    """Min tokens/expert before FP8 GEMM beats BF16 bmm (measured crossover ~2048)."""
 
 
 class MoEBase(nn.Module):
@@ -503,6 +505,7 @@ class MoEBase(nn.Module):
         ep: Optional[ExpertParallelConfig] = None,
         fp8_flow_moe: bool = False,
         fp8_recipe: str = "none",
+        fp8_gemm_threshold: int = 1000000,
     ):
         super().__init__()
         self.d_model = d_model
@@ -543,6 +546,7 @@ class MoEBase(nn.Module):
 
         # FP8-Flow-MoE
         self.fp8_flow_moe_enabled = fp8_flow_moe
+        self.fp8_gemm_threshold = fp8_gemm_threshold
         self._fp8_flow_moe = None
         if fp8_flow_moe:
             from nanopsyche.fp8.flow_moe import FP8FlowMoEConfig, FP8FlowMoECompute
@@ -557,7 +561,11 @@ class MoEBase(nn.Module):
                 fp8_recipe=recipe_config,
             )
             self._fp8_flow_moe = FP8FlowMoECompute(
-                fm_config, d_model, self.hidden_size, num_experts
+                fm_config,
+                d_model,
+                self.hidden_size,
+                num_experts,
+                fp8_gemm_threshold=fp8_gemm_threshold,
             )
             self._fp8_flow_moe.set_weights(self.w1, self.w2, self.w3)
 
@@ -875,6 +883,7 @@ class MoEBase(nn.Module):
         self,
         fp8_flow_moe: bool = True,
         fp8_recipe: str = "flow_moe",
+        fp8_gemm_threshold: int = 1000000,
     ):
         """Enable FP8-Flow-MoE post-construction.
 
@@ -883,11 +892,13 @@ class MoEBase(nn.Module):
 
         :param fp8_flow_moe: enable FP8-Flow-MoE dataflow.
         :param fp8_recipe: recipe name ('none', 'blockwise', 'mxfp8', 'flow_moe').
+        :param fp8_gemm_threshold: min tokens/expert before FP8 GEMM is used.
         """
         from nanopsyche.fp8.flow_moe import FP8FlowMoEConfig, FP8FlowMoECompute
         from nanopsyche.fp8.recipes import FP8RecipeConfig, FP8RecipeType
 
         self.fp8_flow_moe_enabled = fp8_flow_moe
+        self.fp8_gemm_threshold = fp8_gemm_threshold
         if fp8_flow_moe:
             recipe_config = FP8RecipeConfig(
                 enabled=True,
@@ -898,7 +909,11 @@ class MoEBase(nn.Module):
                 fp8_recipe=recipe_config,
             )
             self._fp8_flow_moe = FP8FlowMoECompute(
-                fm_config, self.d_model, self.hidden_size, self.num_experts
+                fm_config,
+                self.d_model,
+                self.hidden_size,
+                self.num_experts,
+                fp8_gemm_threshold=fp8_gemm_threshold,
             )
             self._fp8_flow_moe.set_weights(self.w1, self.w2, self.w3)
         else:
