@@ -17,11 +17,26 @@ from pathlib import Path
 from typing import Any, Optional, Dict
 
 try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ImportError:
+        tomllib = None  # type: ignore[assignment]
+
+try:
     import yaml as _yaml
 
     _HAS_YAML = True
 except ImportError:
     _HAS_YAML = False
+
+try:
+    import tomli_w as _tomli_w
+
+    _HAS_TOMLI_W = True
+except ImportError:
+    _HAS_TOMLI_W = False
 
 
 @dataclass
@@ -39,7 +54,13 @@ class Config:
         path.parent.mkdir(parents=True, exist_ok=True)
         data = self.as_dict()
         with open(path, "w") as f:
-            if path.suffix in (".yaml", ".yml") and _HAS_YAML:
+            if path.suffix == ".toml":
+                if not _HAS_TOMLI_W:
+                    raise ImportError(
+                        "tomli_w is required for TOML output: pip install tomli_w"
+                    )
+                _tomli_w.dump(data, f)
+            elif path.suffix in (".yaml", ".yml") and _HAS_YAML:
                 _yaml.dump(data, f, default_flow_style=False)
             else:
                 json.dump(data, f, indent=2, default=str)
@@ -47,10 +68,18 @@ class Config:
     @classmethod
     def load(cls, path: str | Path) -> "Config":
         path = Path(path)
-        with open(path) as f:
-            if path.suffix in (".yaml", ".yml") and _HAS_YAML:
+        if path.suffix == ".toml":
+            if tomllib is None:
+                raise ImportError(
+                    "TOML support requires Python 3.11+ or 'pip install tomli'"
+                )
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+        elif path.suffix in (".yaml", ".yml") and _HAS_YAML:
+            with open(path) as f:
                 data = _yaml.safe_load(f)
-            else:
+        else:
+            with open(path) as f:
                 data = json.load(f)
         if data is None:
             data = {}
@@ -59,15 +88,24 @@ class Config:
     @classmethod
     def _from_dict(cls, data: Dict[str, Any]) -> "Config":
         import dataclasses
+        import typing
 
-        field_types = {f.name: f.type for f in dataclasses.fields(cls)}
+        try:
+            resolved = typing.get_type_hints(cls)
+        except Exception:
+            resolved = {}
+        field_types = {
+            f.name: resolved.get(f.name, f.type) for f in dataclasses.fields(cls)
+        }
         kwargs = {}
         for key, value in data.items():
             if key not in field_types:
                 continue
             expected_type = field_types[key]
-            if isinstance(value, dict) and hasattr(
-                expected_type, "__dataclass_fields__"
+            if (
+                isinstance(value, dict)
+                and isinstance(expected_type, type)
+                and issubclass(expected_type, Config)
             ):
                 kwargs[key] = expected_type._from_dict(value)
             else:

@@ -667,8 +667,6 @@ def cmd_bench(args: argparse.Namespace):
 
     mfu = compute_mfu(
         step_time_seconds=step_time,
-        tokens_per_step=tokens_per_step,
-        num_params=num_params,
         n_layers=bench_preset["n_layers"],
         d_model=bench_preset["d_model"],
         ffn_hidden=bench_preset.get("ffn_hidden")

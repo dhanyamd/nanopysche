@@ -1,8 +1,16 @@
-"""Parallelism composition — DeviceMesh for DP x TP x PP x CP.
+"""Parallelism composition — DeviceMesh for DP x TP x PP x CP x EP.
+
+Two APIs:
+  1. build_world_mesh(): manual mesh construction (existing)
+  2. ParallelDims: config-driven composable parallelism (TorchTitan pattern)
 
 OLMo-core builds a multi-dimensional DeviceMesh:
     Mesh shape: (pp, dp_replicate, dp_shard, cp, tp)
     Dim names:  ("pp", "dp_replicate", "dp_shard", "cp", "tp")
+
+TorchTitan pattern (ParallelDims):
+    ParallelDims(dp_shard=8, tp=8, pp=1, cp=1, ep=1)
+    -> auto-validates, computes dp_replicate, builds mesh
 
 Sub-meshes:
     get_dp_model_mesh():  all dp* dims flattened (for FSDP/DDP)
@@ -17,9 +25,11 @@ Flattening rules:
 
 Reference: OLMo-core src/olmo_core/distributed/parallel/__init__.py
            PyTorch torch.distributed.device_mesh
+           TorchTitan torchtitan/distributed.parallel_dims.py
 """
 
 import logging
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import torch
@@ -198,3 +208,142 @@ def get_ep_mesh(device_mesh: DeviceMesh) -> DeviceMesh:
     if MeshDimName.dp_shard in dim_names:
         return device_mesh[MeshDimName.dp_shard]
     raise RuntimeError("No EP or DP-shard dimension in mesh")
+
+
+# ---------------------------------------------------------------------------
+# ParallelDims — config-driven composable parallelism (TorchTitan pattern)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ParallelDims:
+    """Config-driven parallelism dimensions.
+
+    Like TorchTitan's ParallelDims, this validates and auto-computes
+    derived dimensions from a flat config. Usage:
+
+        dims = ParallelDims(dp_shard=8, tp=8)
+        # Validates: 8 * 8 = world_size
+        dims.build_mesh(device_type="cuda")
+        # -> DeviceMesh with dp_shard=8, tp=8
+
+    HSDP (hybrid sharded data parallel):
+        dims = ParallelDims(dp_shard=4, dp_replicate=2, tp=4)
+        # Validates: 4 * 2 * 4 = 32 = world_size
+
+    Expert parallelism:
+        dims = ParallelDims(dp_shard=8, tp=1, ep=8)
+        # Experts sharded across 8 ranks, data replicated across 8
+
+    Reference: TorchTitan torchtitan/distributed/parallel_dims.py
+    """
+
+    dp_shard: int = 1
+    dp_replicate: int = 1
+    tp: int = 1
+    pp: int = 1
+    cp: int = 1
+    ep: int = 1
+
+    _world_size: Optional[int] = field(default=None, repr=False)
+    _mesh: Optional[DeviceMesh] = field(default=None, repr=False)
+
+    def __post_init__(self):
+        self._validate()
+
+    def _validate(self):
+        """Validate that dimensions are consistent and compute derived values."""
+        if self.dp_shard < 1:
+            raise ValueError(f"dp_shard must be >= 1, got {self.dp_shard}")
+        if self.tp < 1:
+            raise ValueError(f"tp must be >= 1, got {self.tp}")
+        if self.pp < 1:
+            raise ValueError(f"pp must be >= 1, got {self.pp}")
+        if self.cp < 1:
+            raise ValueError(f"cp must be >= 1, got {self.cp}")
+        if self.ep < 1:
+            raise ValueError(f"ep must be >= 1, got {self.ep}")
+        if self.dp_replicate < 1:
+            raise ValueError(f"dp_replicate must be >= 1, got {self.dp_replicate}")
+
+    @property
+    def world_size(self) -> int:
+        return self.dp_shard * self.dp_replicate * self.tp * self.pp * self.cp * self.ep
+
+    def set_world_size(self, world_size: int):
+        """Set world size and validate. Auto-computes dp_replicate if needed."""
+        self._world_size = world_size
+        if self.dp_replicate == 1:
+            # Auto-compute dp_replicate from remaining dims
+            remainder = world_size // (
+                self.dp_shard * self.tp * self.pp * self.cp * self.ep
+            )
+            if (
+                remainder * self.dp_shard * self.tp * self.pp * self.cp * self.ep
+                != world_size
+            ):
+                raise ValueError(
+                    f"world_size ({world_size}) is not divisible by "
+                    f"dp_shard({self.dp_shard}) * tp({self.tp}) * pp({self.pp}) * "
+                    f"cp({self.cp}) * ep({self.ep})"
+                )
+            self.dp_replicate = remainder
+        else:
+            if self.world_size != world_size:
+                raise ValueError(
+                    f"Parallel dims ({self.world_size}) != world_size ({world_size})"
+                )
+
+    def build_mesh(self, device_type: str = "cuda") -> DeviceMesh:
+        """Build a multi-dimensional DeviceMesh from these dims.
+
+        :param device_type: "cpu" or "cuda".
+        :returns: DeviceMesh with named dimensions.
+        """
+        global _WORLD_MESH
+
+        if self._mesh is not None:
+            return self._mesh
+
+        # Build mesh dimensions: (pp, dp_replicate, dp_shard, ep, cp, tp)
+        # Order matters for DTensor placement
+        mesh_shape = [self.pp]
+        dim_names: List[str] = [MeshDimName.pp]
+
+        if self.dp_replicate > 1:
+            mesh_shape.append(self.dp_replicate)
+            dim_names.append(MeshDimName.dp_replicate)
+
+        mesh_shape.append(self.dp_shard)
+        dim_names.append(MeshDimName.dp_shard)
+
+        if self.ep > 1:
+            mesh_shape.append(self.ep)
+            dim_names.append(MeshDimName.ep)
+
+        if self.cp > 1:
+            mesh_shape.append(self.cp)
+            dim_names.append(MeshDimName.cp)
+
+        if self.tp > 1:
+            mesh_shape.append(self.tp)
+            dim_names.append(MeshDimName.tp)
+
+        mesh = init_device_mesh(
+            device_type, tuple(mesh_shape), mesh_dim_names=tuple(dim_names)
+        )
+        log.info(f"Built device mesh: {dim_names} = {mesh_shape}")
+
+        self._mesh = mesh
+        _WORLD_MESH = mesh
+        return mesh
+
+    @property
+    def mesh(self) -> Optional[DeviceMesh]:
+        return self._mesh
+
+    def __repr__(self) -> str:
+        return (
+            f"ParallelDims(dp_shard={self.dp_shard}, dp_replicate={self.dp_replicate}, "
+            f"tp={self.tp}, pp={self.pp}, cp={self.cp}, ep={self.ep})"
+        )

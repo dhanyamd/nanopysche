@@ -18,21 +18,21 @@ found and fixed 17 implementation bugs in the paper's dataflow specification.
  │                    │  │                    │  │                    │  │   FAULT TOLERANCE  │
  │  RMSNorm           │  │  TP (Megatron)     │  │  Trainer           │  │  Distributed-      │
  │  RoPE (YaRN)       │  │  CP (Ring+Ulysses) │  │  (callback driven) │  │  Checkpointer      │
- │  Attention         │  │  PP (GPipe, 1F1B,  │  │  Scheduler         │  │  (async atomic)    │
- │  (MHA/GQA/MQA)     │  │   DualPipe, ZB)    │  │  (Cosine, WSD, Exp)│  │                    │
- │  SwiGLU FFN        │  │  EP (A2A dispatch) │  │  Data (rank-       │  │  RNG State Save    │
+ │  Attention         │  │  PP (GPipe, 1F1B,  │  │  Scheduler         │  │  (process-based    │
+ │  (MHA/GQA/MQA)     │  │   DualPipe, ZB)    │  │  (Cosine, WSD, Exp)│  │   async, incremental│
+ │  SwiGLU FFN        │  │  EP (A2A dispatch) │  │  Data (rank-       │  │  plan caching)     │
  │  MoEBase           │  │  FSDP2 (full shard)│  │   sharded)         │  │                    │
- │  (DeepSeek-V3 bias)│  │                    │  │  Callbacks         │  │  Hang Detector     │
- │  MoEHybridBlock    ├──┤                    ├──┤  (7: speed, mem,   ├──┤  (watchdog thread) │
- │  (dense+MoE async  │  │                    │  │   wandb, console,  │  │                    │
- │   overlap)         │  │                    │  │   profiler, stab.) │  │  ADAMW / DiLoCo    │
- │  FP8 (torchao)     │  │                    │  │                    │  │  FP8 (torchao)     │
- │  FP8-Flow-MoE      │  │                    │  │                    │  │                    │
+ │  (DeepSeek-V3 bias)│  │  DeepEP (Hopper+)  │  │  Callbacks         │  │  RNG State Save    │
+ │  MoEHybridBlock    ├──┤  Adaptive SM Alloc  ├──┤  (7: speed, mem,   ├──┤  Dataloader State  │
+ │  (dense+MoE async  │  │  Routing Prefetch  │  │   wandb, console,  │  │  Hang Detector     │
+ │   overlap)         │  │                    │  │   profiler, stab.) │  │  (watchdog thread) │
+ │  FP8 (torchao)     │  │                    │  │                    │  │  Pinned Mem Stager │
+ │  FP8-Flow-MoE      │  │                    │  │                    │  │  ADAMW / DiLoCo    │
  └────────────────────┘  └─────────┬──────────┘  └─────────┬──────────┘  └────────────────────┘
                                    │                       │
                            ┌───────▼───────────────────────▼──────────────┐
-                           │         DeviceMesh (hybrid, up to 5D)        │
-                           │       DP × TP × PP × CP × EP                │
+                           │       DeviceMesh (hybrid, up to 5D)          │
+                           │     ParallelDims → TP × PP × CP × EP × DP  │
                            └─────────────────────────────────────────────┘
 ```
 

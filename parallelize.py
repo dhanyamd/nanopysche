@@ -31,6 +31,7 @@ from nanopsyche.parallel import (
     get_tp_mesh,
     get_cp_mesh,
     get_pp_mesh,
+    ParallelDims,
 )
 from nanopsyche.distributed.tensor_parallel import TensorParallelConfig
 from nanopsyche.distributed.context_parallel import ContextParallelConfig

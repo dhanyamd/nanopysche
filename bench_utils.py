@@ -104,8 +104,6 @@ def get_peak_flops(device: Optional[torch.device] = None, fp8: bool = False) -> 
 
 
 def estimate_model_flops(
-    num_params: int,
-    num_non_embed_params: int,
     n_layers: int,
     d_model: int,
     ffn_hidden: int,
@@ -115,11 +113,10 @@ def estimate_model_flops(
     num_experts: int = 0,
     top_k: int = 0,
 ) -> float:
-    """Estimate FLOPs per forward+backward pass.
+    """Estimate FLOPs for one forward+backward pass.
 
-    Uses the standard 6 * N formula for the decoder layers,
-    plus attention FLOPs explicitly. For MoE, only top_k experts
-    are activated per token.
+    Computed from architecture dims (attention + MLP per layer), not the
+    6N shortcut. For MoE, only top_k experts are activated per token.
 
     :returns: total FLOPs for one training step (forward+backward).
     """
@@ -157,8 +154,6 @@ def estimate_model_flops(
 
 def compute_mfu(
     step_time_seconds: float,
-    tokens_per_step: int,
-    num_params: int,
     n_layers: int,
     d_model: int,
     ffn_hidden: int,
@@ -179,8 +174,6 @@ def compute_mfu(
     Reference: PaLM §4.2, OLMo §5.1
 
     :param step_time_seconds: wall-clock time for one training step.
-    :param tokens_per_step: total tokens processed (global_batch_size * seq_len).
-    :param num_params: total model parameters.
     :param device: GPU device.
     :param fp8: whether using FP8 computation.
     :param num_gpus: number of GPUs.
@@ -202,8 +195,6 @@ def compute_mfu(
         return 0.0
 
     step_flops = estimate_model_flops(
-        num_params=num_params,
-        num_non_embed_params=num_params,  # rough: all params counted
         n_layers=n_layers,
         d_model=d_model,
         ffn_hidden=ffn_hidden,
